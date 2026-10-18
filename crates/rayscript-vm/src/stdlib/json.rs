@@ -143,7 +143,8 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn quote(s: &str, out: &mut String) {
+/// `s` as a JSON string, quotes included.
+pub fn quote(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
         match c {
@@ -237,19 +238,31 @@ fn write(vm: &mut Vm, v: Value, indent: &str, level: usize, out: &mut String) ->
     Ok(())
 }
 
+/// The value a JSON text stands for.
+pub fn parse(vm: &mut Vm, text: &str) -> NativeResult {
+    let mut r = Reader { text, pos: 0 };
+    let v = r.value(vm, 0)?;
+    r.ws();
+    if r.pos != text.len() {
+        return r.fail(vm, "there is more after the value");
+    }
+    Ok(v)
+}
+
+/// A value as compact JSON text.
+pub fn stringify(vm: &mut Vm, v: Value) -> Result<String, Value> {
+    let mut out = String::new();
+    write(vm, v, "", 0, &mut out)?;
+    Ok(out)
+}
+
 pub fn install(vm: &mut Vm) {
     vm.define_module(
         "haxe.Json",
         &[
             ("parse", |vm, args| {
                 let text = str_arg(vm, args, 0, "Json.parse")?;
-                let mut r = Reader { text, pos: 0 };
-                let v = r.value(vm, 0)?;
-                r.ws();
-                if r.pos != text.len() {
-                    return r.fail(vm, "there is more after the value");
-                }
-                Ok(v)
+                parse(vm, text)
             }),
             ("stringify", |vm, args| {
                 let indent = match args.get(2) {

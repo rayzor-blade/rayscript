@@ -25,6 +25,14 @@ name = "rayscript-gc"
 version = "0.1.0"
 
 [[package]]
+name = "rayscript-host"
+version = "0.1.0"
+dependencies = [
+ "rayscript-syntax",
+ "rayscript-vm",
+]
+
+[[package]]
 name = "rayscript-syntax"
 version = "0.1.0"
 dependencies = [

@@ -110,6 +110,7 @@ pub struct Vm {
     pub(crate) nested_base: usize,
     pub(crate) collections: usize,
     pub(crate) view: crate::view::ViewState,
+    pub(crate) trace_sink: Option<Rc<dyn Fn(&str)>>,
 }
 
 impl Default for Vm {
@@ -148,6 +149,7 @@ impl Vm {
             nested_base: 0,
             collections: 0,
             view: Default::default(),
+            trace_sink: None,
         };
         crate::stdlib::install(&mut vm);
         crate::view::install(&mut vm);
@@ -238,6 +240,38 @@ impl Vm {
     }
 
     // Names
+
+    /// Where `trace` writes, in place of standard output.
+    pub fn set_trace_sink(&mut self, sink: Rc<dyn Fn(&str)>) {
+        self.trace_sink = Some(sink);
+    }
+
+    /// A field of an object by name; None if `object` is not an object or has no such field.
+    pub fn get_member(&self, object: Value, name: &str) -> Option<Value> {
+        let sym = self.syms.lookup(name)?;
+        match object {
+            Value::Obj(o) if o.kind() == Kind::Object => o.object().fields.get(sym),
+            _ => None,
+        }
+    }
+
+    /// The names and values of an object's fields, in the order they were added; empty for anything else.
+    pub fn object_fields(&self, object: Value) -> Vec<(String, Value)> {
+        match object {
+            Value::Obj(o) if o.kind() == Kind::Object => o.object().fields.iter().map(|(s, v)| (self.syms.name(*s).to_string(), *v)).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// How many fibers have started and not ended.
+    pub fn fiber_count(&self) -> usize {
+        self.fibers.len()
+    }
+
+    /// How many promises wait for the host to settle them.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
 
     pub fn intern(&mut self, name: &str) -> u32 {
         self.syms.intern(name)

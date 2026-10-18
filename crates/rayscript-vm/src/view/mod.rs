@@ -92,6 +92,7 @@ pub(crate) struct Node {
 /// A view being shown: the element the host puts it in, and the scope that owns its effects.
 pub(crate) struct Mount {
     pub root: u32,
+    pub name: String,
     pub scope: Obj,
 }
 
@@ -191,13 +192,24 @@ impl Vm {
     /// Runs ready fibers and effects until nothing is left to do. `fuel` limits each fiber's turn.
     pub fn view_pump(&mut self, fuel: u64) {
         for _ in 0..10_000 {
-            self.run_until_idle(fuel);
-            self.view_reap_handlers();
-            self.view_flush();
-            if !self.has_ready() && self.view.queue.is_empty() {
+            if !self.view_step(fuel) {
                 break;
             }
         }
+    }
+
+    /// One round: every ready fiber gets a turn of at most `fuel` polls, then the effects they marked run.
+    /// True if there is more to do, such as a fiber that gave up its turn.
+    pub fn view_step(&mut self, fuel: u64) -> bool {
+        self.tick(fuel);
+        self.view_reap_handlers();
+        self.view_flush();
+        self.has_ready() || !self.view.queue.is_empty()
+    }
+
+    /// The views being shown: each root's id and the name it was mounted with.
+    pub fn view_mounts(&self) -> Vec<(u32, String)> {
+        self.view.mounts.iter().map(|m| (m.root, m.name.clone())).collect()
     }
 
     fn view_reap_handlers(&mut self) {
@@ -227,7 +239,7 @@ impl Vm {
         self.view.observer = observer;
         match result {
             Ok(()) => {
-                self.view.mounts.push(Mount { root, scope });
+                self.view.mounts.push(Mount { root, name: name.to_string(), scope });
                 Ok(root)
             }
             Err(e) => {
@@ -255,6 +267,13 @@ impl Vm {
             _ => None,
         };
         let Some(handler) = handler else { return false };
+        // A host function is called here and now; its answer, if it is a promise, is nobody's to wait for.
+        if matches!(handler, Value::Native(_)) {
+            if let Err(e) = self.call(handler, &[payload]) {
+                self.view_error(e);
+            }
+            return true;
+        }
         match self.spawn(handler, &[payload]) {
             Ok(fiber) => {
                 if let Some(o) = fiber.as_obj() {

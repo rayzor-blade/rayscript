@@ -1,0 +1,14 @@
+[package]
+name = "rayscript-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Runs one RayScript extension in its own process, and talks to the editor in JSON lines."
+
+[[bin]]
+name = "rayscript-host"
+path = "src/main.rs"
+
+[dependencies]
+rayscript-syntax.workspace = true
+rayscript-vm.workspace = true

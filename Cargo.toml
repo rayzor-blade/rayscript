@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/rayscript-syntax", "crates/rayscript-gc", "crates/rayscript-vm", "crates/rayscript-cli"]
+members = ["crates/rayscript-syntax", "crates/rayscript-gc", "crates/rayscript-vm", "crates/rayscript-host", "crates/rayscript-cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,7 @@ description = "RayScript: hscript's logic and HXX markup in one dynamic language
 rayscript-syntax = { path = "crates/rayscript-syntax" }
 rayscript-gc = { path = "crates/rayscript-gc" }
 rayscript-vm = { path = "crates/rayscript-vm" }
+rayscript-host = { path = "crates/rayscript-host" }
 
 [profile.release]
 debug = 1

@@ -3,7 +3,7 @@
 //! embedding the VM would register its own, so scripts import them the same way.
 
 mod array;
-mod json;
+pub mod json;
 mod map;
 mod modules;
 mod string;
@@ -15,7 +15,10 @@ use crate::vm::{NativeResult, Vm};
 pub fn install(vm: &mut Vm) {
     vm.define_native("trace", |vm, args| {
         let text = args.iter().map(|a| vm.display(*a)).collect::<Vec<_>>().join(" ");
-        println!("{text}");
+        match vm.trace_sink.clone() {
+            Some(sink) => sink(&text),
+            None => println!("{text}"),
+        }
         Ok(Value::Nil)
     });
     vm.define_native("yield", |vm, _| {
