@@ -1,0 +1,14 @@
+[package]
+name = "rayscript-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The rayscript command: parse, check and run."
+
+[[bin]]
+name = "rayscript"
+path = "src/main.rs"
+
+[dependencies]
+rayscript-syntax.workspace = true
+rayscript-vm.workspace = true

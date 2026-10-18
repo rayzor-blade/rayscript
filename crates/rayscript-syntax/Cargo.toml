@@ -1,0 +1,8 @@
+[package]
+name = "rayscript-syntax"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RayScript's lexer, parser and syntax tree, with markup and error recovery."
+
+[dependencies]

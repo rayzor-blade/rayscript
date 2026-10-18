@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/rayscript-syntax", "crates/rayscript-vm", "crates/rayscript-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "RayScript: hscript's logic and HXX markup in one dynamic language, on a Rust bytecode VM with fibers."
+
+[workspace.dependencies]
+rayscript-syntax = { path = "crates/rayscript-syntax" }
+rayscript-vm = { path = "crates/rayscript-vm" }
+
+[profile.release]
+debug = 1
