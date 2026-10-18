@@ -2,11 +2,13 @@
 //! heap objects, so a collection needs no help from the Rust stack: it marks from the globals, the
 //! constants, the fibers and what the host holds, and nothing else.
 
+mod debug;
 mod exec;
 mod gc;
 pub(crate) mod ops;
 mod sched;
 
+pub use debug::{DebugFrame, DebugVar, Debugger, PauseReason, StepMode};
 pub use exec::Exit;
 pub use ops::type_name;
 pub use sched::{Budget, Slice};
@@ -64,6 +66,8 @@ pub(crate) struct LoadedProto {
     pub syms: Vec<u32>,
     pub upvals: Vec<UpvalDesc>,
     pub module: u32,
+    /// Named variables, for a debugger.
+    pub locals: Vec<crate::bytecode::LocalInfo>,
 }
 
 pub(crate) struct LoadedModule {
@@ -115,6 +119,7 @@ pub struct Vm {
     pub(crate) call_fuel: u64,
     /// Fibers a script started with `spawn` that failed with nobody waiting.
     pub(crate) detached_failures: Vec<(crate::fiber::Failure, String)>,
+    pub(crate) debug: Debugger,
 }
 
 impl Default for Vm {
@@ -156,6 +161,7 @@ impl Vm {
             trace_sink: None,
             call_fuel: u64::MAX,
             detached_failures: Vec::new(),
+            debug: Debugger::default(),
         };
         crate::stdlib::install(&mut vm);
         crate::view::install(&mut vm);
@@ -468,16 +474,21 @@ impl Vm {
         Ok(ns)
     }
 
-    /// Parses, compiles and runs a script to its end, and gives its top-level `return`, or `null`. The text
-    /// of an error is the diagnostics as they would be shown, or the error the script ended with and where.
-    pub fn run_source(&mut self, name: &str, source: &str) -> Result<Value, String> {
+    /// Parses, compiles and loads a script and makes a fiber of its statements, which runs when the VM next does.
+    pub fn start_source(&mut self, name: &str, source: &str) -> Result<Value, String> {
         let parsed = rayscript_syntax::parse(source);
         if parsed.has_errors() {
             return Err(render_all(&parsed.diagnostics, name, source, self.fancy_errors));
         }
         let module = crate::compiler::compile(name, source, &parsed.module).map_err(|diags| render_all(&diags, name, source, self.fancy_errors))?;
         let id = self.load(&module);
-        let fiber = self.spawn_main(id).map_err(|e| self.display(e))?;
+        self.spawn_main(id).map_err(|e| self.display(e))
+    }
+
+    /// Parses, compiles and runs a script to its end, and gives its top-level `return`, or `null`. The text
+    /// of an error is the diagnostics as they would be shown, or the error the script ended with and where.
+    pub fn run_source(&mut self, name: &str, source: &str) -> Result<Value, String> {
+        let fiber = self.start_source(name, source)?;
         self.run_until_idle(10_000);
         match self.fiber_state(fiber) {
             Some(FiberState::Done) => Ok(self.fiber_result(fiber).unwrap_or(Value::Nil)),
@@ -567,9 +578,13 @@ impl Vm {
                 syms,
                 upvals: p.upvals.clone(),
                 module: module_id,
+                locals: p.locals.clone(),
             }));
         }
         self.modules.push(LoadedModule { name: module.name.clone(), source: module.source.clone(), lines: LineIndex::new(&module.source), main: module.main + base, globals: HashMap::new() });
+        if !self.debug.wanted_is_empty() {
+            self.debug_resolve();
+        }
         module_id
     }
 

@@ -52,6 +52,8 @@ pub enum Slice {
     Done,
     Failed,
     Cancelled,
+    /// Stopped by the debugger; `debug_resume` lets it go on.
+    Paused,
 }
 
 impl Vm {
@@ -96,6 +98,11 @@ impl Vm {
             Exit::Cancelled => {
                 self.finish(o, FiberState::Cancelled, Value::Nil, None, Value::Nil);
                 Slice::Cancelled
+            }
+            Exit::Paused(reason) => {
+                o.fiber().fiber.state = FiberState::Ready;
+                self.debug_stopped(o, reason);
+                Slice::Paused
             }
         }
     }
@@ -147,6 +154,9 @@ impl Vm {
     /// Runs each fiber that is ready once, for at most `fuel` polls; returns how many ran. Those that
     /// yield go to the back of the queue.
     pub fn tick(&mut self, fuel: u64) -> usize {
+        if self.debug.paused.is_some() {
+            return 0;
+        }
         let n = self.ready.len();
         let mut ran = 0;
         for _ in 0..n {
@@ -155,8 +165,11 @@ impl Vm {
                 continue;
             }
             let mut budget = Budget::fuel(fuel);
-            if self.run_obj(o, &mut budget) == Slice::Yielded {
-                self.ready.push_back(o);
+            match self.run_obj(o, &mut budget) {
+                Slice::Yielded => self.ready.push_back(o),
+                // Stopped: the rest of the round waits, and the fiber is put first in the queue when it goes on.
+                Slice::Paused => return ran + 1,
+                _ => {}
             }
             ran += 1;
         }
@@ -170,7 +183,7 @@ impl Vm {
 
     /// Whether any fiber is ready to run.
     pub fn has_ready(&self) -> bool {
-        !self.ready.is_empty()
+        !self.ready.is_empty() && self.debug.paused.is_none()
     }
 
     fn settle(&mut self, id: u64, state: Settled) -> bool {
@@ -245,7 +258,7 @@ impl Vm {
                             self.run_obj(o, &mut Budget::unlimited());
                             break Err(self.new_string(&message));
                         }
-                        Slice::Yielded => continue,
+                        Slice::Yielded | Slice::Paused => continue,
                         Slice::Done => break Ok(o.fiber().fiber.result),
                         Slice::Failed => break Err(o.fiber().fiber.error),
                         Slice::Cancelled => break Err(self.new_string("cancelled")),

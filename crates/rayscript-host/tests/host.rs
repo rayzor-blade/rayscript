@@ -487,3 +487,122 @@ fn a_tab_view_is_unmounted_when_the_editor_closes_it() {
     let d = e.of_kind("describe")[0];
     assert_eq!(e.reader.display(e.field(d, "mounts")).matches("tab:").count(), 1);
 }
+
+const COUNTER: &str = "var n = signal(0);
+function bump() {
+  var next = n.value + 1;
+  n.value = next;
+}
+mount(() -> <div><b>{n}</b><button onClick={() -> bump()}>+</button></div>);
+";
+
+impl Editor {
+    /// The element `i` of an array a message holds.
+    fn at(&self, list: Value, i: usize) -> Value {
+        match list {
+            Value::Obj(o) if o.kind() == rayscript_vm::object::Kind::Array => o.array().items[i],
+            other => panic!("not a list: {}", self.reader.display(other)),
+        }
+    }
+
+    fn debug(&mut self, op: &str, rest: &str) {
+        self.send(&format!("{{\"t\":\"debug\",\"op\":\"{op}\"{rest}}}"));
+        self.settle();
+    }
+
+    fn last(&self, t: &str) -> &Msg {
+        self.of_kind(t).last().unwrap_or_else(|| panic!("the host sent no `{t}`"))
+    }
+}
+
+#[test]
+fn a_breakpoint_in_a_handler_stops_it_and_the_editor_can_look_and_go_on() {
+    let mut e = Editor::new();
+    e.debug("breakpoints", ",\"file\":\"main.rays\",\"lines\":[4]");
+    assert_eq!(e.reader.display(e.field(e.last("breakpoints"), "lines")), "[4]", "asked before the file is loaded, kept as asked");
+    e.run(COUNTER);
+    e.settle();
+    e.no_errors();
+    assert_eq!(e.reader.display(e.field(e.last("breakpoints"), "lines")), "[4]");
+    e.click("button");
+    let paused = e.last("paused");
+    assert_eq!(e.text(paused, "reason"), "breakpoint");
+    let frames = e.field(paused, "frames");
+    let top = e.at(frames, 0);
+    assert_eq!((e.reader.string_of(e.reader.get_member(top, "function").unwrap()).unwrap(), e.reader.display(e.reader.get_member(top, "line").unwrap())), ("bump", "4".to_string()));
+    // The view has not changed: the line that does it has not run.
+    assert_eq!(e.html(), "<div><b>0</b><button>+</button></div>");
+    e.debug("variables", ",\"frame\":0");
+    let vars = e.last("variables");
+    let locals = e.field(vars, "locals");
+    let first = e.at(locals, 0);
+    assert_eq!(e.reader.display(e.reader.get_member(first, "name").unwrap()), "next");
+    assert_eq!(e.reader.display(e.reader.get_member(first, "value").unwrap()), "1");
+    e.debug("evaluate", ",\"frame\":0,\"expr\":\"n.value\"");
+    let evaluated = e.last("evaluated");
+    assert_eq!(e.reader.display(e.field(evaluated, "ok")), "true");
+    assert_eq!(e.reader.display(e.reader.get_member(e.field(evaluated, "result"), "value").unwrap()), "0");
+    e.debug("evaluate", ",\"frame\":0,\"expr\":\"missing\"");
+    assert!(e.text(e.last("evaluated"), "message").contains("not defined"));
+    e.debug("continue", "");
+    assert_eq!(e.of_kind("resumed").len(), 1);
+    assert_eq!(e.html(), "<div><b>1</b><button>+</button></div>");
+    e.no_errors();
+}
+
+#[test]
+fn a_stopped_script_runs_nothing_until_it_goes_on_and_holds_the_events_that_come() {
+    let mut e = Editor::new();
+    e.debug("breakpoints", ",\"file\":\"main.rays\",\"lines\":[4]");
+    e.run(COUNTER);
+    e.settle();
+    e.click("button");
+    assert_eq!(e.of_kind("paused").len(), 1);
+    // Another click while it is stopped is kept, and the host does not spin waiting for it.
+    let id = e.dom.find(e.roots[0], "button")[0];
+    e.send(&format!("{{\"t\":\"event\",\"node\":{id},\"event\":\"click\"}}"));
+    assert!(!e.host.pump(), "nothing to do while a fiber is stopped");
+    e.collect();
+    assert_eq!(e.html(), "<div><b>0</b><button>+</button></div>");
+    // It stops again for the second handler, once the first is done.
+    e.debug("continue", "");
+    assert_eq!(e.of_kind("paused").len(), 2, "the held click stops at the same line");
+    assert_eq!(e.html(), "<div><b>1</b><button>+</button></div>");
+    e.debug("breakpoints", ",\"file\":\"main.rays\",\"lines\":[]");
+    e.debug("continue", "");
+    assert_eq!(e.html(), "<div><b>2</b><button>+</button></div>");
+    e.no_errors();
+}
+
+#[test]
+fn stepping_a_stopped_handler_says_where_it_stops_next() {
+    let mut e = Editor::new();
+    e.debug("breakpoints", ",\"file\":\"main.rays\",\"lines\":[3]");
+    e.run(COUNTER);
+    e.settle();
+    e.click("button");
+    let line_of = |e: &Editor| {
+        let frames = e.field(e.last("paused"), "frames");
+        e.reader.display(e.reader.get_member(e.at(frames, 0), "line").unwrap())
+    };
+    assert_eq!(line_of(&e), "3");
+    e.debug("stepOver", "");
+    assert_eq!((e.text(e.last("paused"), "reason"), line_of(&e)), ("step".to_string(), "4".to_string()));
+    e.debug("stepOver", "");
+    // The handler returns: no line left to stop at, and the view has changed.
+    assert_eq!(e.html(), "<div><b>1</b><button>+</button></div>");
+    e.no_errors();
+}
+
+#[test]
+fn debug_messages_that_need_a_stopped_script_say_so_when_there_is_none() {
+    let mut e = Editor::new();
+    e.run(COUNTER);
+    e.settle();
+    e.debug("continue", "");
+    e.debug("variables", ",\"frame\":0");
+    e.debug("nonsense", "");
+    let errors: Vec<String> = e.of_kind("error").iter().map(|m| e.text(m, "message")).collect();
+    assert_eq!(errors.len(), 3, "{errors:?}");
+    assert!(errors[0].contains("no fiber is stopped") && errors[2].contains("Unknown `debug` op"), "{errors:?}");
+}

@@ -114,6 +114,9 @@ pub enum Op {
 
     /// Suspends the fiber until `src` (a fiber or a host request) is done; its value goes to `dst`.
     Await { dst: Reg, src: Reg },
+
+    /// Put in place of an instruction by the debugger, which keeps the original: where a fiber may stop.
+    Break,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -131,6 +134,17 @@ pub struct UpvalDesc {
     pub index: u16,
 }
 
+/// A named variable of a function, for a debugger: the register it lives in (holding a cell when a closure captures
+/// it) and the instructions, from `start` up to `end`, it is in scope for.
+#[derive(Clone, Debug)]
+pub struct LocalInfo {
+    pub name: Rc<str>,
+    pub reg: Reg,
+    pub cell: bool,
+    pub start: u32,
+    pub end: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct Proto {
     pub name: Rc<str>,
@@ -144,6 +158,8 @@ pub struct Proto {
     pub offsets: Vec<u32>,
     pub consts: Vec<Const>,
     pub upvals: Vec<UpvalDesc>,
+    /// The function's named variables, in the order they were declared.
+    pub locals: Vec<LocalInfo>,
 }
 
 /// A compiled script: its functions, with `main` the one that runs the module's own statements.

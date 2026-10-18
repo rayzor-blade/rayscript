@@ -18,6 +18,8 @@ pub enum Exit {
     Yield,
     Wait,
     Cancelled,
+    /// Stopped by the debugger before an instruction that has not run; its `pc` is saved.
+    Paused(super::PauseReason),
 }
 
 impl Vm {
@@ -137,6 +139,10 @@ impl Vm {
                     save_pc!();
                     self.collect();
                 }
+                // Where the debugger puts back the stops it took out to let an instruction run.
+                if self.debug.dirty {
+                    self.debug_sync();
+                }
             }};
         }
         macro_rules! native_call {
@@ -250,6 +256,17 @@ impl Vm {
             pc += 1;
             match op {
                 Op::Nop => {}
+                Op::Break => {
+                    pc -= 1;
+                    match self.debug_hit(fo, frame_idx, pc, closure.closure().proto as usize) {
+                        Some(reason) => {
+                            save_pc!();
+                            return Exit::Paused(reason);
+                        }
+                        // The instruction is back in its place: run it.
+                        None => continue,
+                    }
+                }
                 Op::Move { dst, src } => {
                     let v = reg!(src);
                     reg!(dst) = v;

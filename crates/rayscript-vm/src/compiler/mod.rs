@@ -7,7 +7,7 @@ mod control;
 mod expr;
 mod markup;
 
-use crate::bytecode::{Const, Module, Op, Proto, Reg, UpvalDesc};
+use crate::bytecode::{Const, LocalInfo, Module, Op, Proto, Reg, UpvalDesc};
 use rayscript_syntax::ast::{self, Item};
 use rayscript_syntax::span::{Diagnostic, Span};
 use std::collections::{HashMap, HashSet};
@@ -38,6 +38,8 @@ struct Scope {
     locals: Vec<(String, Local)>,
     /// The first register above this scope's locals when it began.
     mark: Reg,
+    /// Where each local of the scope is in the function's `infos`, to close its range when the scope ends.
+    infos: Vec<usize>,
 }
 
 pub(crate) struct LoopCtx {
@@ -63,6 +65,7 @@ pub(crate) struct FnState {
     consts: Vec<Const>,
     const_map: HashMap<ConstKey, u32>,
     scopes: Vec<Scope>,
+    infos: Vec<LocalInfo>,
     free: Reg,
     max: Reg,
     upvals: Vec<UpvalDesc>,
@@ -108,7 +111,8 @@ impl Compiler {
             offsets: Vec::new(),
             consts: Vec::new(),
             const_map: HashMap::new(),
-            scopes: vec![Scope { locals: Vec::new(), mark: 0 }],
+            scopes: vec![Scope { locals: Vec::new(), mark: 0, infos: Vec::new() }],
+            infos: Vec::new(),
             free: params,
             max: params,
             upvals: Vec::new(),
@@ -121,8 +125,12 @@ impl Compiler {
 
     /// Finishes the function being compiled and returns its index among the protos.
     pub(crate) fn end_function(&mut self) -> u32 {
-        let f = self.fns.pop().unwrap();
-        let proto = Proto { name: f.name, params: f.params, has_rest: f.has_rest, registers: f.max.max(1), code: f.code, offsets: f.offsets, consts: f.consts, upvals: f.upvals };
+        let mut f = self.fns.pop().unwrap();
+        let end = f.code.len() as u32;
+        for info in &mut f.infos {
+            info.end = info.end.min(end);
+        }
+        let proto = Proto { name: f.name, params: f.params, has_rest: f.has_rest, registers: f.max.max(1), code: f.code, offsets: f.offsets, consts: f.consts, upvals: f.upvals, locals: f.infos };
         self.protos.push(proto);
         (self.protos.len() - 1) as u32
     }
@@ -241,12 +249,25 @@ impl Compiler {
 
     pub(crate) fn push_scope(&mut self) {
         let mark = self.f().free;
-        self.f().scopes.push(Scope { locals: Vec::new(), mark });
+        self.f().scopes.push(Scope { locals: Vec::new(), mark, infos: Vec::new() });
     }
 
     pub(crate) fn pop_scope(&mut self) {
         let s = self.f().scopes.pop().unwrap();
+        let end = self.f().code.len() as u32;
+        for i in &s.infos {
+            self.f().infos[*i].end = end;
+        }
         self.f().free = s.mark;
+    }
+
+    /// Records a named local for the debugger, in scope from here to the end of the scope it is declared in.
+    fn note_local(&mut self, name: &str, local: Local) {
+        let start = self.f().code.len() as u32;
+        let f = self.f();
+        f.infos.push(LocalInfo { name: Rc::from(name), reg: local.reg, cell: local.cell, start, end: u32::MAX });
+        let at = f.infos.len() - 1;
+        f.scopes.last_mut().unwrap().infos.push(at);
     }
 
     /// Whether the code being emitted is the module's own statements, outside every block.
@@ -260,6 +281,7 @@ impl Compiler {
         let cell = self.captured.contains(&decl);
         let local = Local { reg, cell };
         self.f().scopes.last_mut().unwrap().locals.push((name.to_string(), local));
+        self.note_local(name, local);
         local
     }
 
@@ -267,6 +289,7 @@ impl Compiler {
     pub(crate) fn declare_as(&mut self, name: &str, reg: Reg, cell: bool) -> Local {
         let local = Local { reg, cell };
         self.f().scopes.last_mut().unwrap().locals.push((name.to_string(), local));
+        self.note_local(name, local);
         local
     }
 

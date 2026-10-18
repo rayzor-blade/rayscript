@@ -216,6 +216,10 @@ impl Vm {
     /// One round: every ready fiber gets a turn of at most `fuel` polls, then the effects they marked run.
     /// True if there is more to do, such as a fiber that gave up its turn.
     pub fn view_step(&mut self, fuel: u64) -> bool {
+        // A fiber stopped by the debugger holds everything still: nothing runs, and nothing is flushed.
+        if self.debug_paused().is_some() {
+            return false;
+        }
         self.tick(fuel);
         self.view_reap_handlers();
         self.view_flush();

@@ -24,6 +24,18 @@
 //!   host unmounts it.
 //! - `{"t":"tool","id":"add"}` says a tool of the extension's header was chosen: the handler the script
 //!   gave `onTool("add", handler)` runs. Without one, an `error` of kind `view` says so.
+//! - `{"t":"debug","op":"breakpoints","file":"/path/main.rays","lines":[3,9]}` puts the breakpoints of a file on
+//!   those lines, replacing the ones it had, and is answered with `{"t":"breakpoints","file":..,"lines":[..]}`: the
+//!   lines as they stand, each moved down to a line that has code. A file that is not loaded yet takes them when it is.
+//!   `{"t":"debug","op":"pause"}` stops the running script at its next instruction. A fiber that stops (at a
+//!   breakpoint, a step, or a pause) is announced with `{"t":"paused","reason":"breakpoint|step|pause","frames":[{"function","file","line","col"}]}`,
+//!   the innermost frame first, and the script then runs nothing until it is told to go on.
+//!   While stopped: `{"t":"debug","op":"continue|stepOver|stepIn|stepOut"}` goes on, answered with `{"t":"resumed"}`;
+//!   `{"t":"debug","op":"variables","frame":0}` gives `{"t":"variables","frame":0,"locals":[..],"globals":[..]}`, each variable
+//!   `{"name","value","type","ref"}` with a `ref` other than 0 when there is more inside; `{"t":"debug","op":"expand","ref":3}` gives
+//!   `{"t":"children","ref":3,"items":[..]}`; `{"t":"debug","op":"evaluate","frame":0,"expr":"todo.items[1].title"}` gives
+//!   `{"t":"evaluated","expr":..,"ok":true,"result":{..}}` or `"ok":false` with a `message`. An expression is a name and
+//!   members and indexes of it, not arithmetic or calls.
 //! - `{"t":"describe"}` asks what the host is doing.
 //! - `{"t":"shutdown"}` ends the host. So does the end of its input.
 //!
@@ -152,6 +164,8 @@ pub struct Host {
     shutdown: bool,
     ops_sent: u64,
     slice: Duration,
+    /// Whether the editor has been told about the fiber that is stopped.
+    pause_told: bool,
 }
 
 impl Host {
@@ -244,7 +258,7 @@ impl Host {
             });
         }
         let slice = if config.slice.is_zero() { Duration::from_millis(4) } else { config.slice };
-        Host { vm, out, modules, timers, tools, hooks, commands, scripts: Vec::new(), shutdown: false, ops_sent: 0, slice }
+        Host { vm, out, modules, timers, tools, hooks, commands, scripts: Vec::new(), shutdown: false, ops_sent: 0, slice, pause_told: false }
     }
 
     pub fn vm(&mut self) -> &mut Vm {
@@ -396,9 +410,133 @@ impl Host {
                 }
                 None => self.error("protocol", "`closed` requires \"root\"", ""),
             },
+            "debug" => self.debug(msg),
             "describe" => self.describe(),
             "shutdown" => self.shutdown = true,
             other => self.error("protocol", &format!("Unknown message type `{other}`"), ""),
+        }
+    }
+
+    fn var_json(v: &rayscript_vm::DebugVar) -> String {
+        let mut out = String::from("{\"name\":");
+        quote(&v.name, &mut out);
+        out.push_str(",\"value\":");
+        quote(&v.value, &mut out);
+        out.push_str(",\"type\":");
+        quote(v.type_name, &mut out);
+        out.push_str(&format!(",\"ref\":{}}}", v.reference));
+        out
+    }
+
+    fn vars_json(vars: &[rayscript_vm::DebugVar]) -> String {
+        vars.iter().map(Host::var_json).collect::<Vec<_>>().join(",")
+    }
+
+    /// Tells the editor a fiber has stopped, with where, once.
+    fn tell_pause(&mut self) {
+        let Some(reason) = self.vm.debug_paused() else {
+            self.pause_told = false;
+            return;
+        };
+        if self.pause_told {
+            return;
+        }
+        self.pause_told = true;
+        let frames: Vec<String> = self
+            .vm
+            .debug_frames()
+            .iter()
+            .map(|f| {
+                let mut out = String::from("{\"function\":");
+                quote(&f.function, &mut out);
+                out.push_str(",\"file\":");
+                quote(&f.file, &mut out);
+                out.push_str(&format!(",\"line\":{},\"col\":{}}}", f.line, f.col));
+                out
+            })
+            .collect();
+        let reason = match reason {
+            rayscript_vm::PauseReason::Breakpoint => "breakpoint",
+            rayscript_vm::PauseReason::Step => "step",
+            rayscript_vm::PauseReason::Request => "pause",
+        };
+        self.send(format!("{{\"t\":\"paused\",\"reason\":\"{reason}\",\"frames\":[{}]}}", frames.join(",")));
+    }
+
+    /// The debugging messages: breakpoints and pausing at any time, the rest while a fiber is stopped.
+    fn debug(&mut self, msg: Value) {
+        let Some(op) = self.string_field(msg, "op") else {
+            self.error("protocol", "`debug` requires \"op\"", "");
+            return;
+        };
+        let stopped = self.vm.debug_paused().is_some();
+        match op.as_str() {
+            "breakpoints" => {
+                let (Some(file), Some(Value::Obj(list))) = (self.string_field(msg, "file"), self.vm.get_member(msg, "lines")) else {
+                    self.error("protocol", "`debug` `breakpoints` requires \"file\" and \"lines\"", "");
+                    return;
+                };
+                let lines: Vec<u32> = list
+                    .array()
+                    .items
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Int(n) if *n > 0 => Some(*n as u32),
+                        _ => None,
+                    })
+                    .collect();
+                let placed = self.vm.debug_set_breakpoints(&file, &lines);
+                // A module that is not loaded yet takes the lines as they were asked when it is.
+                let shown = if self.vm.debug_module_loaded(&file) { placed } else { lines };
+                let mut line = String::from("{\"t\":\"breakpoints\",\"file\":");
+                quote(&file, &mut line);
+                line.push_str(&format!(",\"lines\":[{}]}}", shown.iter().map(|l| l.to_string()).collect::<Vec<_>>().join(",")));
+                self.send(line);
+            }
+            "pause" => self.vm.debug_pause(),
+            "continue" | "stepOver" | "stepIn" | "stepOut" => {
+                if !stopped {
+                    self.error("protocol", &format!("`debug` `{op}`: no fiber is stopped"), "");
+                    return;
+                }
+                let mode = match op.as_str() {
+                    "stepOver" => Some(rayscript_vm::StepMode::Over),
+                    "stepIn" => Some(rayscript_vm::StepMode::In),
+                    "stepOut" => Some(rayscript_vm::StepMode::Out),
+                    _ => None,
+                };
+                self.vm.debug_resume(mode);
+                self.pause_told = false;
+                self.send("{\"t\":\"resumed\"}".to_string());
+            }
+            "variables" | "expand" | "evaluate" if !stopped => self.error("protocol", &format!("`debug` `{op}`: no fiber is stopped"), ""),
+            "variables" => {
+                let frame = self.int_field(msg, "frame").unwrap_or(0).max(0) as usize;
+                let locals = self.vm.debug_locals(frame);
+                let globals = self.vm.debug_globals(frame);
+                self.send(format!("{{\"t\":\"variables\",\"frame\":{frame},\"locals\":[{}],\"globals\":[{}]}}", Host::vars_json(&locals), Host::vars_json(&globals)));
+            }
+            "expand" => {
+                let reference = self.int_field(msg, "ref").unwrap_or(0).max(0) as u32;
+                let items = self.vm.debug_expand(reference);
+                self.send(format!("{{\"t\":\"children\",\"ref\":{reference},\"items\":[{}]}}", Host::vars_json(&items)));
+            }
+            "evaluate" => {
+                let frame = self.int_field(msg, "frame").unwrap_or(0).max(0) as usize;
+                let expr = self.string_field(msg, "expr").unwrap_or_default();
+                let mut line = String::from("{\"t\":\"evaluated\",\"expr\":");
+                quote(&expr, &mut line);
+                match self.vm.debug_evaluate(frame, &expr) {
+                    Ok(v) => line.push_str(&format!(",\"ok\":true,\"result\":{}}}", Host::var_json(&v))),
+                    Err(message) => {
+                        line.push_str(",\"ok\":false,\"message\":");
+                        quote(&message, &mut line);
+                        line.push('}');
+                    }
+                }
+                self.send(line);
+            }
+            other => self.error("protocol", &format!("Unknown `debug` op `{other}`"), ""),
         }
     }
 
@@ -570,6 +708,7 @@ impl Host {
             }
         }
         self.report_failures();
+        self.tell_pause();
         for (failure, text) in self.vm.take_detached_failures() {
             let mut items = Vec::new();
             for t in &failure.trace {

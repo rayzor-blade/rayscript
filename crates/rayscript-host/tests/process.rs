@@ -126,3 +126,22 @@ fn nothing_but_protocol_goes_to_standard_output() {
         assert!(l.starts_with("{\"t\":\"") && l.ends_with('}'), "not a protocol line: {l}");
     }
 }
+
+#[test]
+fn a_pause_stops_a_script_that_never_ends_and_it_can_be_looked_at_and_ended() {
+    let mut p = Proc::start();
+    p.expect("ready");
+    p.send(r#"{"t":"run","name":"loop.rays","source":"var n = 0;\nwhile (true) {\n  n++;\n}\n"}"#);
+    std::thread::sleep(Duration::from_millis(50));
+    p.send(r#"{"t":"debug","op":"pause"}"#);
+    let paused = p.expect("\"paused\"");
+    assert!(paused.contains("\"reason\":\"pause\"") && paused.contains("loop.rays"), "{paused}");
+    p.send(r#"{"t":"debug","op":"evaluate","frame":0,"expr":"n"}"#);
+    let n = p.expect("\"evaluated\"");
+    assert!(n.contains("\"ok\":true"), "{n}");
+    // Stopped, it does not use the processor, and the host still answers.
+    p.send(r#"{"t":"describe"}"#);
+    assert!(p.expect("\"describe\"").contains("\"fibers\":1"));
+    p.send(r#"{"t":"shutdown"}"#);
+    assert!(p.wait_exit());
+}

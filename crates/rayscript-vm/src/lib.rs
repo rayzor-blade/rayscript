@@ -12,4 +12,5 @@ pub mod vm;
 
 pub use compiler::compile;
 pub use value::{Obj, Value};
-pub use vm::{Budget, ModuleResolver, NativeFn, NativePtr, NativeResult, Resolved, Slice, Vm};
+pub use fiber::FiberState;
+pub use vm::{Budget, DebugFrame, DebugVar, ModuleResolver, NativeFn, NativePtr, NativeResult, PauseReason, Resolved, Slice, StepMode, Vm};

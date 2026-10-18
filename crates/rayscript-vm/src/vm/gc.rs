@@ -25,6 +25,7 @@ impl Vm {
             roots.extend(m.globals.values().copied());
         }
         roots.extend(self.roots.iter().copied());
+        roots.extend(self.debug.refs.iter().copied());
         for p in &self.protos {
             roots.extend(p.consts.iter().copied());
         }
