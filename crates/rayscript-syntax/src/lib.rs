@@ -11,8 +11,9 @@ pub mod parser;
 pub mod span;
 pub mod token;
 
+pub use ariadne;
 pub use ast::Module;
-pub use span::{Diagnostic, LineIndex, Severity, Span};
+pub use span::{render_all, Diagnostic, LineIndex, Severity, Span};
 
 /// What parsing a script gave.
 pub struct Parsed {

@@ -135,14 +135,28 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn error_with(&mut self, span: Span, message: impl Into<String>, help: Option<&str>) {
+        self.error_labeled(span, message, help, &[]);
+    }
+
+    /// An error that also points at other places, such as where the bracket it wanted to close was opened.
+    pub(crate) fn error_labeled(&mut self, span: Span, message: impl Into<String>, help: Option<&str>, labels: &[(Span, &str)]) {
         // One report for a place: what follows a bad token is usually noise.
         if self.last_error == Some(span.start) {
             return;
         }
         self.last_error = Some(span.start);
+        let message = message.into();
+        // "expected X, found Y" is captioned "expected X"; the message says what was found.
+        let caption = message.strip_prefix("expected ").and_then(|rest| rest.split_once(", found ")).map(|(what, _)| format!("expected {what}"));
         let mut d = Diagnostic::error(message, span);
+        if let Some(c) = caption {
+            d = d.with_caption(c);
+        }
         if let Some(h) = help {
             d = d.with_help(h);
+        }
+        for (at, text) in labels {
+            d = d.with_label(*at, *text);
         }
         self.diags.push(d);
     }
@@ -347,7 +361,11 @@ impl<'a> Parser<'a> {
         }
         if !self.eat(&TokenKind::RBrace) {
             let span = Span::new(start, start + 1);
-            self.error_with(span, "this `{` is never closed", Some("add the matching `}`"));
+            let end = self.cur.span;
+            self.error_labeled(span, "this `{` is never closed", Some("add the matching `}`"), &[(end, "the file ends here")]);
+            if let Some(d) = self.diags.last_mut() {
+                d.caption = Some("opened here".to_string());
+            }
         }
         Expr::new(ExprKind::Block(stmts), Span::new(start, self.prev_end))
     }
@@ -463,6 +481,7 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn parse_args(&mut self) -> Vec<Expr> {
         let mut args = Vec::new();
+        let open = self.cur.span;
         self.expect(&TokenKind::LParen);
         while !self.is(&TokenKind::RParen) && !self.is(&TokenKind::Eof) {
             let before = self.cur.span.start;
@@ -477,7 +496,7 @@ impl<'a> Parser<'a> {
         if !self.eat(&TokenKind::RParen) {
             let found = self.cur.kind.describe();
             let span = self.cur.span;
-            self.error(span, format!("expected `)` or `,` in the arguments, found {found}"));
+            self.error_labeled(span, format!("expected `)` or `,` in the arguments, found {found}"), None, &[(open, "the arguments start here")]);
         }
         args
     }
@@ -654,6 +673,7 @@ impl<'a> Parser<'a> {
             self.expect(&TokenKind::RBracket);
             return Expr::new(ExprKind::Comprehension { map, body: Box::new(body) }, Span::new(start, self.prev_end));
         }
+        let open = Span::new(start, start + 1);
         let mut items: Vec<Expr> = Vec::new();
         let mut pairs: Vec<(Expr, Expr)> = Vec::new();
         let mut is_map = false;
@@ -680,7 +700,7 @@ impl<'a> Parser<'a> {
         if !self.eat(&TokenKind::RBracket) {
             let found = self.cur.kind.describe();
             let span = self.cur.span;
-            self.error(span, format!("expected `]` or `,`, found {found}"));
+            self.error_labeled(span, format!("expected `]` or `,`, found {found}"), None, &[(open, "this `[` is not closed")]);
         }
         let span = Span::new(start, self.prev_end);
         if is_map {
@@ -733,6 +753,7 @@ impl<'a> Parser<'a> {
     fn parse_object(&mut self) -> Expr {
         let start = self.cur.span.start;
         self.advance();
+        let open = Span::new(start, start + 1);
         let mut fields = Vec::new();
         while !self.is(&TokenKind::RBrace) && !self.is(&TokenKind::Eof) {
             let before = self.cur.span.start;
@@ -761,7 +782,7 @@ impl<'a> Parser<'a> {
         if !self.eat(&TokenKind::RBrace) {
             let found = self.cur.kind.describe();
             let span = self.cur.span;
-            self.error(span, format!("expected `}}` or `,` in the object, found {found}"));
+            self.error_labeled(span, format!("expected `}}` or `,` in the object, found {found}"), None, &[(open, "this `{` is not closed")]);
         }
         Expr::new(ExprKind::Object(fields), Span::new(start, self.prev_end))
     }

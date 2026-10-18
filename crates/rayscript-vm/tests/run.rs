@@ -140,19 +140,42 @@ fn errors_are_caught_and_rethrown() {
 fn uncaught_errors_fail_with_a_trace() {
     let mut vm = Vm::new();
     let err = vm.run_source("t.rays", "function f() {\n  throw 'boom';\n}\nfunction g() {\n  f();\n}\ng();").unwrap_err();
-    assert!(err.starts_with("error: boom"), "{err}");
-    assert!(err.contains("at f (t.rays:2:3)"), "{err}");
-    assert!(err.contains("at g (t.rays:5:3)"), "{err}");
-    is("return undefinedName;", "ERROR error: `undefinedName` is not defined");
-    is("var a = null; return a.x;", "ERROR error: cannot read `x` of null");
-    is("return 1 - 'a';", "ERROR error: cannot use `-` on Int and String");
+    assert!(err.starts_with("Error: boom"), "{err}");
+    assert!(err.contains("t.rays:2:3") && err.contains("in `f`"), "{err}");
+    assert!(err.contains("`f` is called here") && err.contains("`g` is called here"), "{err}");
+    assert!(err.contains("throw 'boom';"), "{err}");
+    is("return undefinedName;", "ERROR Error: `undefinedName` is not defined");
+    is("var a = null; return a.x;", "ERROR Error: cannot read `x` of null");
+    is("return 1 - 'a';", "ERROR Error: cannot use `-` on Int and String");
 }
 
 #[test]
 fn syntax_and_compile_errors_are_reported() {
     let mut vm = Vm::new();
     let e = vm.run_source("t.rays", "var = 1;").unwrap_err();
-    assert!(e.contains("t.rays:1:5: error: expected a variable name"), "{e}");
+    assert!(e.starts_with("Error: expected a variable name"), "{e}");
+    assert!(e.contains("t.rays:1:5"), "{e}");
+    assert!(e.contains("var = 1;"), "{e}");
     let e = vm.run_source("t.rays", "break;").unwrap_err();
     assert!(e.contains("`break` is only for inside a loop"), "{e}");
+}
+
+#[test]
+fn a_deep_failure_names_only_the_nearest_calls() {
+    let mut vm = Vm::new();
+    let err = vm.run_source("t.rays", "function f(n) {\n  if (n == 0) throw 'deep';\n  f(n - 1);\n}\nf(30);").unwrap_err();
+    assert!(err.starts_with("Error: deep"), "{err}");
+    assert!(err.contains("more calls"), "{err}");
+    assert!(err.lines().count() < 80, "{err}");
+}
+
+#[test]
+fn error_text_is_plain_unless_asked_otherwise() {
+    let mut vm = Vm::new();
+    let plain = vm.run_source("t.rays", "throw 'x';").unwrap_err();
+    assert!(!plain.contains('\x1b') && plain.is_ascii(), "{plain:?}");
+    let mut vm = Vm::new();
+    vm.set_fancy_errors(true);
+    let fancy = vm.run_source("t.rays", "throw 'x';").unwrap_err();
+    assert!(fancy.contains('\x1b'), "{fancy:?}");
 }

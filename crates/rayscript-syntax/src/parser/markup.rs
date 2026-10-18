@@ -246,10 +246,11 @@ impl<'a> Parser<'a> {
         match end {
             ChildEnd::Close { name } => match (&name, open) {
                 (Some((n, span)), Some((expected, _))) if n != expected => {
-                    self.error_with(*span, format!("this closes `</{n}>`, but the open tag is `<{expected}>`"), Some("the closing tag must have the same name"));
+                    let opened = format!("`<{expected}>` is opened here");
+                    self.error_labeled(*span, format!("this closes `</{n}>`, but the open tag is `<{expected}>`"), Some("the closing tag must have the same name"), &[(open_span, &opened)]);
                 }
                 (Some((n, span)), None) => {
-                    self.error(*span, format!("this closes `</{n}>`, but the open tag is a fragment `<>`"));
+                    self.error_labeled(*span, format!("this closes `</{n}>`, but the open tag is a fragment `<>`"), None, &[(open_span, "the fragment is opened here")]);
                 }
                 (None, Some((expected, _))) => {
                     self.error(open_span, format!("`<{expected}>` is closed with `</>`; close it with `</{expected}>`"));

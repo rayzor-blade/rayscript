@@ -16,7 +16,8 @@ use crate::fiber::{Fiber, FiberState, Frame};
 use crate::heap::{Heap, HeapConfig, HEADER_SIZE};
 use crate::object::*;
 use crate::value::{Obj, Value};
-use rayscript_syntax::span::LineIndex;
+use rayscript_syntax::ariadne::{Cache, Label, Report, Source};
+use rayscript_syntax::span::{self, render_all, LineIndex, Severity, Span};
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
@@ -89,6 +90,7 @@ pub struct Vm {
     pub(crate) host_modules: HashMap<String, Value>,
     /// Script modules brought in by `import`: none while one is being initialised.
     pub(crate) script_modules: HashMap<String, Option<Value>>,
+    fancy_errors: bool,
     pub(crate) resolver: Option<Box<dyn ModuleResolver>>,
     pub(crate) ready: VecDeque<Obj>,
     pub(crate) current: Option<Obj>,
@@ -129,6 +131,7 @@ impl Vm {
             methods: HashMap::new(),
             host_modules: HashMap::new(),
             script_modules: HashMap::new(),
+            fancy_errors: false,
             resolver: None,
             ready: VecDeque::new(),
             current: None,
@@ -378,13 +381,13 @@ impl Vm {
     fn load_script_module(&mut self, path: &str, name: &str, source: &str) -> Result<Value, Value> {
         let parsed = rayscript_syntax::parse(source);
         if parsed.has_errors() {
-            let text = parsed.diagnostics.iter().map(|d| d.render(name, source)).collect::<String>();
+            let text = render_all(&parsed.diagnostics, name, source, false);
             return Err(self.new_string(&text));
         }
         let module = match crate::compiler::compile(name, source, &parsed.module) {
             Ok(m) => m,
             Err(diags) => {
-                let text = diags.iter().map(|d| d.render(name, source)).collect::<String>();
+                let text = render_all(&diags, name, source, false);
                 return Err(self.new_string(&text));
             }
         };
@@ -413,9 +416,9 @@ impl Vm {
     pub fn run_source(&mut self, name: &str, source: &str) -> Result<Value, String> {
         let parsed = rayscript_syntax::parse(source);
         if parsed.has_errors() {
-            return Err(parsed.diagnostics.iter().map(|d| d.render(name, source)).collect());
+            return Err(render_all(&parsed.diagnostics, name, source, self.fancy_errors));
         }
-        let module = crate::compiler::compile(name, source, &parsed.module).map_err(|diags| diags.iter().map(|d| d.render(name, source)).collect::<String>())?;
+        let module = crate::compiler::compile(name, source, &parsed.module).map_err(|diags| render_all(&diags, name, source, self.fancy_errors))?;
         let id = self.load(&module);
         let fiber = self.spawn_main(id).map_err(|e| self.display(e))?;
         self.run_until_idle(10_000);
@@ -427,15 +430,34 @@ impl Vm {
         }
     }
 
-    /// A failed fiber's error and trace as text, with positions.
+    /// Whether error text from `run_source` and `render_failure` has colour and Unicode line drawing, for a
+    /// terminal. Off, it is plain ASCII.
+    pub fn set_fancy_errors(&mut self, fancy: bool) {
+        self.fancy_errors = fancy;
+    }
+
+    /// A failed fiber's error as a report: the message, then the line where it was raised and the calls that
+    /// led there, each with its line.
     pub fn render_failure(&self, fiber: Value) -> String {
         let Some(failure) = self.fiber_failure(fiber) else { return "the fiber did not fail".to_string() };
-        let mut out = format!("error: {}\n", failure.message);
-        for t in &failure.trace {
-            let (name, line, col) = self.locate(t.module, t.offset);
-            out.push_str(&format!("  at {} ({name}:{line}:{col})\n", t.function));
+        let color = Severity::Error.color();
+        let at = |t: &crate::fiber::TraceEntry| {
+            let source = &self.modules[t.module as usize].source;
+            (t.module as usize, token_range(source, t.offset))
+        };
+        let mut out = Vec::new();
+        let Some(first) = failure.trace.first() else { return format!("Error: {}\n", failure.message) };
+        let mut report = Report::build(Severity::Error.kind(), at(first)).with_config(span::config(self.fancy_errors)).with_message(&failure.message);
+        report = report.with_label(Label::new(at(first)).with_message(format!("in `{}`", first.function)).with_color(color));
+        for (callee, t) in failure.trace.iter().zip(failure.trace.iter().skip(1)).take(MAX_TRACE_LABELS) {
+            report = report.with_label(Label::new(at(t)).with_message(format!("`{}` is called here", callee.function)).with_color(span::NOTE_COLOR));
         }
-        out
+        if failure.trace.len() > MAX_TRACE_LABELS + 1 {
+            report = report.with_note(format!("and {} more calls", failure.trace.len() - MAX_TRACE_LABELS - 1));
+        }
+        let cache = ModuleSources { vm: self, sources: std::cell::RefCell::new(HashMap::new()) };
+        let _ = report.finish().write(cache, &mut out);
+        String::from_utf8_lossy(&out).into_owned()
     }
 
     /// A value the host keeps alive until `unroot`.
@@ -614,5 +636,42 @@ impl Vm {
         let m = &self.modules[module as usize];
         let (line, col) = m.lines.locate(&m.source, offset);
         (m.name.clone(), line + 1, col + 1)
+    }
+}
+
+/// The most calls a failure report points at; the rest are counted.
+const MAX_TRACE_LABELS: usize = 8;
+
+/// The source range of the word or symbol at a byte offset.
+fn token_range(source: &str, offset: u32) -> std::ops::Range<usize> {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let start = (offset as usize).min(source.len());
+    let end = match source[start..].chars().next() {
+        Some(c) if word(c) => start + source[start..].find(|c: char| !word(c)).unwrap_or(source.len() - start),
+        _ => start,
+    };
+    span::byte_range(Span::new(start as u32, end as u32), source)
+}
+
+/// Gives a report the source of each module that has code on the failed fiber's stack.
+struct ModuleSources<'a> {
+    vm: &'a Vm,
+    sources: std::cell::RefCell<HashMap<usize, Source<Rc<str>>>>,
+}
+
+impl Cache<usize> for ModuleSources<'_> {
+    type Storage = Rc<str>;
+
+    fn fetch(&mut self, id: &usize) -> Result<&Source<Rc<str>>, impl std::fmt::Debug> {
+        let map = self.sources.get_mut();
+        if !map.contains_key(id) {
+            let module = self.vm.modules.get(*id).ok_or("no such module")?;
+            map.insert(*id, Source::from(module.source.clone()));
+        }
+        Ok::<_, &str>(&map[id])
+    }
+
+    fn display<'a>(&self, id: &'a usize) -> Option<impl std::fmt::Display + 'a> {
+        self.vm.modules.get(*id).map(|m| m.name.clone())
     }
 }

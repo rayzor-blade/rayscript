@@ -6,3 +6,4 @@ license.workspace = true
 description = "RayScript's lexer, parser and syntax tree, with markup and error recovery."
 
 [dependencies]
+ariadne = { version = "0.6", default-features = false }

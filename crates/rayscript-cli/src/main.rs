@@ -1,8 +1,10 @@
 //! `rayscript`: run a script, check it, or look at what the parser and compiler made of it.
 
 use rayscript_syntax::dump::dump_module;
+use rayscript_syntax::render_all;
 use rayscript_vm::bytecode::disassemble_module;
 use rayscript_vm::{ModuleResolver, Resolved, Vm};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -40,10 +42,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Colour and line drawing for a person at a terminal; plain text for a pipe or a log.
+    let fancy = std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     let parsed = rayscript_syntax::parse(&source);
-    for d in &parsed.diagnostics {
-        eprint!("{}", d.render(file, &source));
-    }
+    eprint!("{}", render_all(&parsed.diagnostics, file, &source, fancy));
     if parsed.has_errors() {
         return ExitCode::FAILURE;
     }
@@ -56,9 +58,7 @@ fn main() -> ExitCode {
             let module = match rayscript_vm::compile(file, &source, &parsed.module) {
                 Ok(m) => m,
                 Err(diags) => {
-                    for d in &diags {
-                        eprint!("{}", d.render(file, &source));
-                    }
+                    eprint!("{}", render_all(&diags, file, &source, fancy));
                     return ExitCode::FAILURE;
                 }
             };
@@ -70,6 +70,7 @@ fn main() -> ExitCode {
                 "check" => ExitCode::SUCCESS,
                 _ => {
                     let mut vm = Vm::new();
+                    vm.set_fancy_errors(fancy);
                     let root = Path::new(file).parent().map(Path::to_path_buf).unwrap_or_default();
                     vm.set_resolver(Box::new(Files { root }));
                     match vm.run_source(file, &source) {

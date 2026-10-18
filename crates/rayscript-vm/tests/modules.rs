@@ -29,7 +29,7 @@ fn the_standard_library_is_imported_like_any_module() {
 fn json_round_trips() {
     assert_eq!(run("return Json.stringify(Json.parse('[{\"k\": 1}, {\"k\": 2}]'));"), "[{\"k\":1},{\"k\":2}]");
     assert_eq!(run("return Json.stringify({a: 1}, null, '  ');"), "{\n  \"a\": 1\n}");
-    assert!(run("return Json.parse('{bad');").starts_with("ERROR error: invalid JSON"));
+    assert!(run("return Json.parse('{bad');").starts_with("ERROR Error: invalid JSON"));
 }
 
 struct Scripts;
@@ -82,9 +82,9 @@ fn a_host_module_comes_from_the_resolver_on_demand() {
 fn import_errors_say_what_is_wrong() {
     let mut vm = Vm::new();
     vm.set_resolver(Box::new(Scripts));
-    assert_eq!(run_in(&mut vm, "import nope.Thing; return 1;"), "ERROR error: cannot find the module `nope.Thing`");
+    assert_eq!(run_in(&mut vm, "import nope.Thing; return 1;"), "ERROR Error: cannot find the module `nope.Thing`");
     let e = run_in(&mut vm, "import util.broken; return 1;");
-    assert!(e.starts_with("ERROR error: util/broken.rays:1:5: error: expected a variable name"), "{e}");
+    assert!(e.starts_with("ERROR Error: Error: expected a variable name"), "{e}");
     let e = run_in(&mut vm, "import util.a; return 1;");
     assert!(e.contains("imports itself"), "{e}");
 }

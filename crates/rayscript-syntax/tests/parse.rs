@@ -277,7 +277,8 @@ fn errors_point_at_the_place() {
     let p = parse(src);
     assert_eq!(p.diagnostics.len(), 1);
     let rendered = p.diagnostics[0].render("t.rays", src);
-    assert!(rendered.starts_with("t.rays:2:9: error: expected an expression, found `;`"), "{rendered}");
+    assert!(rendered.starts_with("Error: expected an expression, found `;`"), "{rendered}");
+    assert!(rendered.contains("t.rays:2:9"), "{rendered}");
     assert!(rendered.contains("var b = ;"), "{rendered}");
 }
 
@@ -328,4 +329,28 @@ fn every_prefix_of_a_script_parses_without_panicking() {
             let _ = parse(&s);
         }
     }
+}
+
+#[test]
+fn rendering_copes_with_the_end_of_the_file_and_wide_characters() {
+    for src in ["var a =", "var s = \"héllo\" + ;", "var é = ", "f(\u{1F600}"] {
+        let p = parse(src);
+        assert!(p.has_errors(), "{src:?}");
+        for d in &p.diagnostics {
+            let plain = d.render("t.rays", src);
+            assert!(plain.starts_with("Error: ") && !plain.contains('\x1b'), "{plain}");
+            assert!(d.render_with("t.rays", src, true).contains('\x1b'));
+        }
+    }
+}
+
+#[test]
+fn unclosed_brackets_and_tags_point_back_at_where_they_opened() {
+    let src = "var a = f(1;";
+    let d = &parse(src).diagnostics[0];
+    assert!(d.render("t.rays", src).contains("the arguments start here"));
+    let src = "var a = <div><span>x</b></div>;";
+    let d = &parse(src).diagnostics[0];
+    assert!(d.render("t.rays", src).contains("`<span>` is opened here"));
+    assert_eq!(d.labels.len(), 1);
 }

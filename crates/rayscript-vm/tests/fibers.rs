@@ -30,7 +30,7 @@ return log.join(',');";
 #[test]
 fn an_error_in_a_fiber_reaches_the_one_awaiting_it() {
     assert_eq!(run("var f = spawn(() -> { throw 'x'; }); try { await f; } catch (e) { return 'got ' + e; }"), "got x");
-    assert!(run("var f = spawn(() -> { throw 'x'; }); await f; return 1;").starts_with("ERROR error: x"));
+    assert!(run("var f = spawn(() -> { throw 'x'; }); await f; return 1;").starts_with("ERROR Error: x"));
 }
 
 #[test]
@@ -103,7 +103,7 @@ fn a_rejected_promise_throws_in_the_waiting_script() {
 
 #[test]
 fn a_fiber_cannot_wait_for_itself_and_a_callback_cannot_wait_at_all() {
-    assert!(run("var me = null; me = spawn(() -> await me); await me; return 1;").starts_with("ERROR error: a fiber cannot wait for itself"));
+    assert!(run("var me = null; me = spawn(() -> await me); await me; return 1;").starts_with("ERROR Error: a fiber cannot wait for itself"));
     // A function a built-in calls runs to its end; waiting inside it is an error, not a hang.
     let r = run("var p = spawn(() -> yield()); return [1, 2].map(x -> { await p; return x; });");
     assert!(r.starts_with("ERROR") || r == "[1,2]", "{r}");
