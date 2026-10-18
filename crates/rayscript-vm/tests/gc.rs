@@ -66,3 +66,11 @@ fn a_refused_allocation_fails_the_script_not_the_process() {
     let r = vm.run_source("t.rays", "return 1 + 1;").unwrap();
     assert_eq!(vm.display(r), "2");
 }
+
+#[test]
+fn a_native_may_hold_values_while_its_callback_runs() {
+    let mut vm = Vm::with_config(HeapConfig { stress: true, ..HeapConfig::default() });
+    let src = "var r = [1,2,3,4,5,6].map(x -> { var s = 0; for (i in 0...3) { s += i; } return {a: x, b: [x, x + 1], c: 'v' + x}; }); return r.map(o -> o.c + o.b[1]).join(',');";
+    let r = vm.run_source("t.rays", src).unwrap();
+    assert_eq!(vm.display(r), "v12,v23,v34,v45,v56,v67");
+}

@@ -127,7 +127,8 @@ impl Vm {
                         }
                     }
                 }
-                if self.heap.should_collect() {
+                // Not inside a call a native made: that native may hold values only it refers to.
+                if self.nested == 0 && self.heap.should_collect() {
                     save_pc!();
                     self.collect();
                 }
