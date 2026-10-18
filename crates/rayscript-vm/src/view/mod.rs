@@ -282,14 +282,19 @@ impl Vm {
             _ => None,
         };
         let Some(handler) = handler else { return false };
-        // A host function is called here and now; its answer, if it is a promise, is nobody's to wait for.
+        self.view_spawn_handler(handler, &[payload])
+    }
+
+    /// Runs `handler` as an event handler does: as a fiber, whose failure is reported with the view's errors.
+    /// A host function is called here and now; its answer, if it is a promise, is nobody's to wait for.
+    pub fn view_spawn_handler(&mut self, handler: Value, args: &[Value]) -> bool {
         if matches!(handler, Value::Native(_)) {
-            if let Err(e) = self.call(handler, &[payload]) {
+            if let Err(e) = self.call(handler, args) {
                 self.view_error(e);
             }
             return true;
         }
-        match self.spawn(handler, &[payload]) {
+        match self.spawn(handler, args) {
             Ok(fiber) => {
                 if let Some(o) = fiber.as_obj() {
                     self.view.handlers.push(o);

@@ -395,3 +395,34 @@ fn a_spawned_fiber_that_fails_is_reported() {
     assert_eq!(e.text(errors[0], "kind"), "runtime");
     assert!(e.text(errors[0], "message").contains("lost in the background"));
 }
+
+#[test]
+fn a_tool_of_the_header_runs_the_handler_the_script_gave() {
+    let mut e = Editor::new();
+    e.run("var n = signal(0); onTool('add', () -> n.value++); mount(() -> <b>{n}</b>);");
+    e.settle();
+    assert_eq!(e.html(), "<b>0</b>");
+    e.send("{\"t\":\"tool\",\"id\":\"add\"}");
+    e.send("{\"t\":\"tool\",\"id\":\"add\"}");
+    e.settle();
+    assert_eq!(e.html(), "<b>2</b>");
+    e.no_errors();
+    // A tool nothing answers is said so, with how to answer it.
+    e.send("{\"t\":\"tool\",\"id\":\"nope\"}");
+    e.send("{\"t\":\"tool\"}");
+    e.settle();
+    let errors = e.of_kind("error");
+    assert_eq!(errors.len(), 2);
+    assert!(e.text(errors[0], "message").contains("onTool('nope'"), "{}", e.text(errors[0], "message"));
+}
+
+#[test]
+fn a_script_can_title_its_view() {
+    let mut e = Editor::new();
+    e.run("setTitle('Notes (3)'); await sleep(1); setTitle('He said \"hi\"');");
+    e.settle();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    e.settle();
+    let titles: Vec<String> = e.of_kind("view").iter().map(|m| e.text(m, "title")).collect();
+    assert_eq!(titles, ["Notes (3)", "He said \"hi\""]);
+}

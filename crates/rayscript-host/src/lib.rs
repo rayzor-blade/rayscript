@@ -15,6 +15,8 @@
 //! - `{"t":"event","node":7,"event":"click","payload":...}` sends an event to the handler of an element.
 //!   The payload is any JSON value, and is what the handler is called with.
 //! - `{"t":"resolve","id":3,"value":...}` and `{"t":"reject","id":3,"message":"..."}` answer a `call`.
+//! - `{"t":"tool","id":"add"}` says a tool of the extension's header was chosen: the handler the script
+//!   gave `onTool("add", handler)` runs. Without one, an `error` of kind `view` says so.
 //! - `{"t":"describe"}` asks what the host is doing.
 //! - `{"t":"shutdown"}` ends the host. So does the end of its input.
 //!
@@ -32,13 +34,15 @@
 //!   `name` property; the editor puts it where the name says.
 //! - `{"t":"call","id":3,"fn":"rayde.workspace.say","args":[...]}` calls a function of a remote module.
 //!   Answer with `resolve` or `reject`. Operations the script has made before the call are sent before it.
+//! - `{"t":"view","title":"..."}` when the script called `setTitle(text)`: the heading of the extension's view.
 //! - `{"t":"log","message":"..."}` is what the script `trace`d.
 //! - `{"t":"error","kind":"syntax"|"compile"|"runtime"|"view"|"protocol","message":"...","items":[...]}`
 //!   says what went wrong. `message` is text for a person; `items` are the same problems with positions:
 //!   `{"message","file","line","col","endLine","endCol","help","function"}`, each field only when known.
 //! - `{"t":"describe","mounts":[...],"nodes":n,...}` answers `describe`.
 //!
-//! A script may `sleep(milliseconds)`, which is a promise too.
+//! A script may `sleep(milliseconds)`, which is a promise too, `onTool(id, handler)` to answer a tool of its
+//! header, and `setTitle(text)` to change the heading of its view.
 
 pub mod wire;
 
@@ -131,6 +135,7 @@ pub struct Host {
     out: Outbox,
     modules: Rc<RefCell<HashMap<String, Vec<String>>>>,
     timers: Rc<RefCell<BinaryHeap<Reverse<(Instant, u64)>>>>,
+    tools: Rc<RefCell<HashMap<String, Value>>>,
     scripts: Vec<(String, Value, bool)>,
     shutdown: bool,
     ops_sent: u64,
@@ -167,8 +172,32 @@ impl Host {
                 Ok(promise)
             });
         }
+        let tools: Rc<RefCell<HashMap<String, Value>>> = Rc::new(RefCell::new(HashMap::new()));
+        {
+            let tools = tools.clone();
+            vm.define_native("onTool", move |vm, args| {
+                let (Some(id), Some(handler)) = (args.first().and_then(|v| vm.string_of(*v)).map(str::to_string), args.get(1).copied()) else {
+                    return Err(vm.new_string("onTool needs the id of a tool and a function"));
+                };
+                // The handler is kept for the life of the extension.
+                vm.root(handler);
+                tools.borrow_mut().insert(id, handler);
+                Ok(Value::Nil)
+            });
+        }
+        {
+            let out = out.clone();
+            vm.define_native("setTitle", move |vm, args| {
+                let text = args.first().map(|v| vm.display(*v)).unwrap_or_default();
+                let mut line = String::from("{\"t\":\"view\",\"title\":");
+                quote(&text, &mut line);
+                line.push('}');
+                out.borrow_mut().push(line);
+                Ok(Value::Nil)
+            });
+        }
         let slice = if config.slice.is_zero() { Duration::from_millis(4) } else { config.slice };
-        Host { vm, out, modules, timers, scripts: Vec::new(), shutdown: false, ops_sent: 0, slice }
+        Host { vm, out, modules, timers, tools, scripts: Vec::new(), shutdown: false, ops_sent: 0, slice }
     }
 
     pub fn vm(&mut self) -> &mut Vm {
@@ -277,6 +306,18 @@ impl Host {
                     self.error("protocol", &format!("no call is waiting for id {id}"), "");
                 }
             }
+            "tool" => match self.string_field(msg, "id") {
+                Some(id) => {
+                    let handler = self.tools.borrow().get(&id).copied();
+                    match handler {
+                        Some(h) => {
+                            self.vm.view_spawn_handler(h, &[]);
+                        }
+                        None => self.error("view", &format!("the extension has no handler for the tool `{id}`: write onTool('{id}', () -> ...)"), ""),
+                    }
+                }
+                None => self.error("protocol", "`tool` needs the \"id\" of a tool", ""),
+            },
             "describe" => self.describe(),
             "shutdown" => self.shutdown = true,
             other => self.error("protocol", &format!("unknown message `{other}`"), ""),
