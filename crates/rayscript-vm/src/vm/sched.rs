@@ -115,6 +115,12 @@ impl Vm {
             std::mem::take(&mut f.waiters)
         };
         self.fibers.retain(|x| *x != o);
+        if state == FiberState::Failed && o.fiber().fiber.detached && waiters.is_empty() {
+            let text = self.render_failure(Value::Obj(o));
+            if let Some(f) = o.fiber().fiber.failure.clone() {
+                self.detached_failures.push((f, text));
+            }
+        }
         let wake = match state {
             FiberState::Done => Wake::Value(result),
             FiberState::Failed => Wake::Throw(error),
@@ -185,6 +191,21 @@ impl Vm {
         true
     }
 
+    /// Says that a call ran out of polls, and where it was.
+    fn too_long(&self, fiber: Obj) -> String {
+        let limit = self.call_fuel;
+        let top = fiber.fiber().fiber.frames.last().copied();
+        match top {
+            Some(fr) => {
+                let proto = &self.protos[fr.closure.closure().proto as usize];
+                let offset = proto.offsets.get(fr.pc.saturating_sub(1)).copied().unwrap_or(0);
+                let (file, line, col) = self.locate(proto.module, offset);
+                format!("stopped: it ran for more than {limit} steps, in `{}` ({file}:{line}:{col})", proto.name)
+            }
+            None => format!("stopped: it ran for more than {limit} steps"),
+        }
+    }
+
     /// Settles the promise with `new_promise`'s number: those waiting for it go on with the value.
     pub fn resolve(&mut self, id: u64, v: Value) -> bool {
         self.settle(id, Settled::Resolved(v))
@@ -215,9 +236,15 @@ impl Vm {
                 // It runs here and now, not from the queue.
                 self.ready.retain(|x| *x != o);
                 self.nested += 1;
-                let mut budget = Budget::unlimited();
+                let mut budget = Budget::fuel(self.call_fuel);
                 let result = loop {
                     match self.run_obj(o, &mut budget) {
+                        Slice::Yielded if budget.fuel == 0 => {
+                            let message = self.too_long(o);
+                            self.cancel(fiber);
+                            self.run_obj(o, &mut Budget::unlimited());
+                            break Err(self.new_string(&message));
+                        }
                         Slice::Yielded => continue,
                         Slice::Done => break Ok(o.fiber().fiber.result),
                         Slice::Failed => break Err(o.fiber().fiber.error),

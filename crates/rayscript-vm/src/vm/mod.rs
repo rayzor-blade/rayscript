@@ -111,6 +111,10 @@ pub struct Vm {
     pub(crate) collections: usize,
     pub(crate) view: crate::view::ViewState,
     pub(crate) trace_sink: Option<Rc<dyn Fn(&str)>>,
+    /// Polls a call a native makes back into script may use before it is stopped.
+    pub(crate) call_fuel: u64,
+    /// Fibers a script started with `spawn` that failed with nobody waiting.
+    pub(crate) detached_failures: Vec<(crate::fiber::Failure, String)>,
 }
 
 impl Default for Vm {
@@ -150,6 +154,8 @@ impl Vm {
             collections: 0,
             view: Default::default(),
             trace_sink: None,
+            call_fuel: u64::MAX,
+            detached_failures: Vec::new(),
         };
         crate::stdlib::install(&mut vm);
         crate::view::install(&mut vm);
@@ -240,6 +246,17 @@ impl Vm {
     }
 
     // Names
+
+    /// Limits each call a native makes back into script, such as an effect or a callback, to this many
+    /// polls (loop edges and calls). A call over the limit is stopped with an error that says where.
+    pub fn set_call_fuel(&mut self, polls: u64) {
+        self.call_fuel = polls;
+    }
+
+    /// The failures of fibers that `spawn` started and nothing waited for, since the last call.
+    pub fn take_detached_failures(&mut self) -> Vec<(crate::fiber::Failure, String)> {
+        std::mem::take(&mut self.detached_failures)
+    }
 
     /// Where `trace` writes, in place of standard output.
     pub fn set_trace_sink(&mut self, sink: Rc<dyn Fn(&str)>) {

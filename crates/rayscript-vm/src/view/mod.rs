@@ -113,6 +113,8 @@ pub(crate) struct ViewState {
     pub mounts: Vec<Mount>,
     /// Fibers running event handlers, until they end.
     pub handlers: Vec<Obj>,
+    /// When a flush must stop, leaving the rest of the effects queued.
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl ViewState {
@@ -159,7 +161,14 @@ impl Vm {
         self.view.errors.push(text);
     }
 
-    /// Runs the effects that signals have marked, and those they mark in turn, until none are left.
+    /// A flush that reaches this time stops and leaves the effects it has not run queued, to be run by
+    /// the next one. None for no limit.
+    pub fn set_view_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.view.deadline = deadline;
+    }
+
+    /// Runs the effects that signals have marked, and those they mark in turn, until none are left or
+    /// the deadline has passed.
     pub fn view_flush(&mut self) {
         let mut runs = 0;
         while !self.view.queue.is_empty() {
@@ -167,6 +176,12 @@ impl Vm {
             // Older first: an effect made inside another is younger, and the older may dispose it.
             batch.sort_by_key(|o| o.reactive().seq);
             for (i, o) in batch.iter().enumerate() {
+                if i % 32 == 31 && self.view.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    // What is left stays marked and queued, ahead of what these runs queued.
+                    let rest = batch[i..].to_vec();
+                    self.view.queue.splice(0..0, rest);
+                    return;
+                }
                 o.reactive().queued = false;
                 if o.reactive().state == RState::Disposed {
                     continue;

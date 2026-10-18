@@ -76,6 +76,8 @@ pub struct Fiber {
     /// Fibers parked on this one finishing.
     pub waiters: Vec<Obj>,
     pub cancelled: bool,
+    /// Started by a script's `spawn`: a failure nobody is waiting for is kept for the host.
+    pub detached: bool,
     pub id: u64,
 }
 
@@ -94,6 +96,7 @@ impl Fiber {
             error: Value::Nil,
             waiters: Vec::new(),
             cancelled: false,
+            detached: false,
             id,
         }
     }

@@ -352,3 +352,29 @@ fn shutdown_ends_the_host() {
     e.send("{\"t\":\"shutdown\"}");
     assert!(e.host.is_shutdown());
 }
+
+#[test]
+fn an_effect_that_never_ends_is_stopped_and_the_host_goes_on() {
+    let mut e = Editor::with(Config { call_fuel: 50_000, ..Config::default() });
+    e.run("var s = signal(0); var n = signal(0); effect(() -> { if (s.value == 1) { while (true) { } } }); mount(() -> <div><b onClick={() -> s.value = 1}>go</b><i onClick={() -> n.value++}>{n}</i></div>);");
+    e.settle();
+    e.click("b");
+    let errors = e.of_kind("error");
+    assert_eq!(errors.len(), 1);
+    assert_eq!(e.text(errors[0], "kind"), "view");
+    assert!(e.text(errors[0], "message").contains("ran for more than 50000 steps"));
+    // The host still takes events.
+    e.click("i");
+    assert_eq!(e.html(), "<div><b>go</b><i>1</i></div>");
+}
+
+#[test]
+fn a_spawned_fiber_that_fails_is_reported() {
+    let mut e = Editor::new();
+    e.run("spawn(() -> { throw 'lost in the background'; });");
+    e.settle();
+    let errors = e.of_kind("error");
+    assert_eq!(errors.len(), 1);
+    assert_eq!(e.text(errors[0], "kind"), "runtime");
+    assert!(e.text(errors[0], "message").contains("lost in the background"));
+}

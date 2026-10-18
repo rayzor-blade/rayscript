@@ -27,7 +27,11 @@ pub fn install(vm: &mut Vm) {
     });
     vm.define_native("spawn", |vm, args| {
         let Some((f, rest)) = args.split_first() else { return Err(vm.new_string("spawn needs a function")) };
-        vm.spawn(*f, rest)
+        let fiber = vm.spawn(*f, rest)?;
+        if let Some(o) = fiber.as_obj() {
+            o.fiber().fiber.detached = true;
+        }
+        Ok(fiber)
     });
     vm.define_native("cancel", |vm, args| {
         if let Some(f) = args.first() {

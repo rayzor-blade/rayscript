@@ -65,6 +65,9 @@ pub struct Config {
     pub root: Option<PathBuf>,
     /// How long one `pump` may run before it gives the thread back.
     pub slice: Duration,
+    /// Polls (loop edges and calls) one effect, computed value or other call from a built-in may use
+    /// before it is stopped; 0 for the default of five million.
+    pub call_fuel: u64,
 }
 
 struct Resolver {
@@ -134,6 +137,7 @@ pub struct Host {
 impl Host {
     pub fn new(config: Config) -> Host {
         let mut vm = Vm::new();
+        vm.set_call_fuel(if config.call_fuel == 0 { 5_000_000 } else { config.call_fuel });
         let out: Outbox = Rc::new(RefCell::new(Vec::new()));
         let modules = Rc::new(RefCell::new(HashMap::new()));
         let timers = Rc::new(RefCell::new(BinaryHeap::new()));
@@ -416,6 +420,7 @@ impl Host {
     /// more to do right away.
     pub fn pump(&mut self) -> bool {
         let deadline = Instant::now() + self.slice;
+        self.vm.set_view_deadline(Some(deadline));
         self.fire_timers();
         let mut more;
         loop {
@@ -425,6 +430,14 @@ impl Host {
             }
         }
         self.report_failures();
+        for (failure, text) in self.vm.take_detached_failures() {
+            let mut items = Vec::new();
+            for t in &failure.trace {
+                let (file, line, col) = self.vm.locate(t.module, t.offset);
+                items.push(self.item(&failure.message, &file, Some((line, col, line, col)), None, Some(&t.function)));
+            }
+            self.error("runtime", &text, &items.join(","));
+        }
         for e in self.vm.view_take_errors() {
             self.error("view", &e, "");
         }
