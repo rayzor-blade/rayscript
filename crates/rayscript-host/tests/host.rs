@@ -244,6 +244,23 @@ fn trace_is_a_log_message_and_not_protocol_noise() {
 }
 
 #[test]
+fn a_script_that_compiles_is_said_to_have_started_and_one_that_does_not_is_not() {
+    let mut e = Editor::new();
+    e.run("var ok = 1;\nvar = 2;");
+    e.settle();
+    assert!(e.of_kind("started").is_empty());
+    e.run("mount(() -> <i>x</i>);");
+    e.settle();
+    let started = e.of_kind("started");
+    assert_eq!(started.len(), 1);
+    assert_eq!(e.text(started[0], "name"), "main.rays");
+    // It comes before the operations the script makes.
+    let at = e.got.iter().position(|m| m.t == "started").unwrap();
+    let ops = e.got.iter().position(|m| m.t == "ops").unwrap();
+    assert!(at < ops);
+}
+
+#[test]
 fn a_syntax_error_comes_with_where() {
     let mut e = Editor::new();
     e.run("var ok = 1;\nvar = 2;");

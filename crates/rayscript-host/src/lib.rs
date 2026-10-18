@@ -21,6 +21,9 @@
 //! # From the host to the editor
 //!
 //! - `{"t":"ready","protocol":1}` once, first.
+//! - `{"t":"started","name":"main.rays"}` when a `run` compiled and has begun. Without it (an `error` of
+//!   kind `syntax` or `compile` instead), the script did not run: an editor can keep showing the last one
+//!   that did.
 //! - `{"t":"ops","ops":[...]}` changes to the element tree, in order. Elements are numbered by the host.
 //!   Each operation is an array: `["create",id,tag]`, `["createText",id,text]`, `["setText",id,text]`,
 //!   `["set",id,name,value]`, `["unset",id,name]`, `["listen",id,event]`, `["unlisten",id,event]`,
@@ -367,6 +370,10 @@ impl Host {
             Ok(fiber) => {
                 self.vm.root(fiber);
                 self.scripts.push((name.to_string(), fiber, false));
+                let mut line = String::from("{\"t\":\"started\",\"name\":");
+                quote(name, &mut line);
+                line.push('}');
+                self.send(line);
             }
             Err(e) => {
                 let text = self.vm.display(e);
