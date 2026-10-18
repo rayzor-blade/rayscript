@@ -3,6 +3,7 @@
 use rayscript_syntax::dump::dump_module;
 use rayscript_syntax::render_all;
 use rayscript_vm::bytecode::disassemble_module;
+use rayscript_vm::view::{Dom, ViewOp};
 use rayscript_vm::{ModuleResolver, Resolved, Vm};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ const USAGE: &str = "usage: rayscript <command> <file.rays>
   check   report what is wrong with it, running nothing
   parse   print the syntax tree
   dump    print the bytecode
+  view    run the script, then print the elements its views made
 ";
 
 /// `import a.b.C` finds `a/b/C.rays` beside the script that is running.
@@ -54,7 +56,7 @@ fn main() -> ExitCode {
             println!("{}", dump_module(&parsed.module));
             ExitCode::SUCCESS
         }
-        "check" | "dump" | "run" => {
+        "check" | "dump" | "run" | "view" => {
             let module = match rayscript_vm::compile(file, &source, &parsed.module) {
                 Ok(m) => m,
                 Err(diags) => {
@@ -78,7 +80,27 @@ fn main() -> ExitCode {
                             if !v.is_nil() {
                                 println!("{}", vm.display(v));
                             }
-                            ExitCode::SUCCESS
+                            vm.view_pump(1_000_000);
+                            let ops = vm.view_take_ops();
+                            let errors = vm.view_take_errors();
+                            for e in &errors {
+                                eprint!("{e}");
+                            }
+                            if command == "view" {
+                                let mut dom = Dom::new();
+                                if let Err(e) = dom.apply(&ops) {
+                                    eprintln!("rayscript: {e}");
+                                    return ExitCode::FAILURE;
+                                }
+                                for op in &ops {
+                                    if let ViewOp::Create { id, tag } = op {
+                                        if tag == "#root" {
+                                            print!("{}", dom.pretty(*id));
+                                        }
+                                    }
+                                }
+                            }
+                            if errors.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
                         }
                         Err(e) => {
                             eprint!("{e}");

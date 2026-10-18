@@ -7,6 +7,7 @@ pub use rayscript_gc as heap;
 pub mod object;
 pub mod stdlib;
 pub mod value;
+pub mod view;
 pub mod vm;
 
 pub use compiler::compile;

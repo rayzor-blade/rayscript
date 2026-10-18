@@ -77,6 +77,10 @@ pub fn display(vm: &Vm, v: Value, depth: usize) -> String {
             Kind::Fiber => format!("<fiber {}>", o.fiber().fiber.id),
             Kind::Promise => "<promise>".into(),
             Kind::Host => "<host object>".into(),
+            Kind::Signal => format!("<signal {}>", display(vm, o.signal().value, depth + 1)),
+            Kind::Reactive => "<computed>".into(),
+            Kind::Template => "<view>".into(),
+            Kind::Props => "<props>".into(),
         },
     }
 }
@@ -177,6 +181,9 @@ impl Vm {
                     "to" | "max" => return Ok(Value::Int(o.range().to)),
                     _ => {}
                 },
+                Kind::Signal if self.syms.name(sym) == "value" => return Ok(self.signal_get(o)),
+                Kind::Reactive if self.syms.name(sym) == "value" => return self.reactive_get(o, true),
+                Kind::Props => return self.props_get(o, sym),
                 _ => {}
             }
         }
@@ -186,9 +193,17 @@ impl Vm {
 
     pub(crate) fn set_field(&mut self, obj: Value, sym: u32, v: Value) -> Result<(), Value> {
         if let Value::Obj(o) = obj {
-            if o.kind() == Kind::Object {
-                o.object().fields.set(sym, v);
-                return Ok(());
+            match o.kind() {
+                Kind::Object => {
+                    o.object().fields.set(sym, v);
+                    return Ok(());
+                }
+                Kind::Signal if self.syms.name(sym) == "value" => {
+                    self.signal_set(o, v);
+                    return Ok(());
+                }
+                Kind::Reactive if self.syms.name(sym) == "value" => return Err(self.err("a computed value is read only")),
+                _ => {}
             }
         }
         let name = self.syms.name(sym).to_string();

@@ -40,6 +40,7 @@ impl Vm {
         for p in self.pending.values() {
             roots.push(Value::Obj(*p));
         }
+        self.view.trace(&mut |v| roots.push(v));
         for v in roots {
             mark(&mut self.heap, &mut gray, v);
         }

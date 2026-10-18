@@ -8,6 +8,18 @@ use crate::object::{Kind, Settled};
 use crate::value::{Obj, Value};
 use std::time::Instant;
 
+/// How much of the Rust stack calls from a built-in back into script may use between them, from the
+/// outermost of them: each level is several frames of the interpreter. The thread that runs a VM needs
+/// at least this much to spare and some more for what is below the outermost: run a VM on a thread with
+/// a stack of 16 MiB or more.
+const MAX_NESTED_STACK: usize = 4 * 1024 * 1024;
+
+/// Where the stack is now, near enough to measure how far it has grown.
+fn stack_mark() -> usize {
+    let probe = 0u8;
+    std::hint::black_box(&probe) as *const u8 as usize
+}
+
 /// How long a fiber may run before it must give way: a number of polls (loop edges and calls), and
 /// optionally a time.
 pub struct Budget {
@@ -192,6 +204,12 @@ impl Vm {
                 f(self, args)
             }
             Value::Obj(c) if c.kind() == Kind::Closure => {
+                let here = stack_mark();
+                if self.nested == 0 {
+                    self.nested_base = here;
+                } else if here.abs_diff(self.nested_base) > MAX_NESTED_STACK {
+                    return Err(self.new_string("calls from built-in functions are nested too deeply"));
+                }
                 let fiber = self.spawn(callee, args)?;
                 let o = fiber.as_obj().unwrap();
                 // It runs here and now, not from the queue.

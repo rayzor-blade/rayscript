@@ -106,7 +106,10 @@ pub struct Vm {
     pub(crate) roots: Vec<Value>,
     /// How deep a native's call back into script is; a fiber cannot suspend inside one.
     pub(crate) nested: u32,
+    /// The stack position of the outermost call a native made back into script.
+    pub(crate) nested_base: usize,
     pub(crate) collections: usize,
+    pub(crate) view: crate::view::ViewState,
 }
 
 impl Default for Vm {
@@ -142,9 +145,12 @@ impl Vm {
             yield_flag: false,
             roots: Vec::new(),
             nested: 0,
+            nested_base: 0,
             collections: 0,
+            view: Default::default(),
         };
         crate::stdlib::install(&mut vm);
+        crate::view::install(&mut vm);
         vm
     }
 

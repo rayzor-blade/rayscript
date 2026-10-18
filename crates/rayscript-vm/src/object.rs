@@ -6,6 +6,7 @@
 use crate::fiber::Fiber;
 use crate::heap::Header;
 use crate::value::{Obj, Value};
+use crate::view::{PropsObj, ReactiveObj, SignalObj, TemplateObj};
 use std::any::Any;
 use std::collections::HashMap;
 
@@ -22,6 +23,10 @@ pub enum Kind {
     Fiber,
     Promise,
     Host,
+    Signal,
+    Reactive,
+    Template,
+    Props,
 }
 
 impl Kind {
@@ -37,6 +42,10 @@ impl Kind {
             8 => Kind::Fiber,
             9 => Kind::Promise,
             10 => Kind::Host,
+            11 => Kind::Signal,
+            12 => Kind::Reactive,
+            13 => Kind::Template,
+            14 => Kind::Props,
             _ => unreachable!("a header with an unknown kind"),
         }
     }
@@ -58,6 +67,10 @@ impl Kind {
             Kind::Fiber => "Fiber",
             Kind::Promise => "Promise",
             Kind::Host => "Host",
+            Kind::Signal => "Signal",
+            Kind::Reactive => "Computed",
+            Kind::Template => "View",
+            Kind::Props => "Props",
         }
     }
 }
@@ -189,6 +202,26 @@ impl Obj {
         unsafe { &mut *(self.0.as_ptr() as *mut PromiseObj) }
     }
 
+    pub fn signal<'a>(self) -> &'a mut SignalObj {
+        debug_assert_eq!(self.kind(), Kind::Signal);
+        unsafe { &mut *(self.0.as_ptr() as *mut SignalObj) }
+    }
+
+    pub fn reactive<'a>(self) -> &'a mut ReactiveObj {
+        debug_assert_eq!(self.kind(), Kind::Reactive);
+        unsafe { &mut *(self.0.as_ptr() as *mut ReactiveObj) }
+    }
+
+    pub fn template<'a>(self) -> &'a mut TemplateObj {
+        debug_assert_eq!(self.kind(), Kind::Template);
+        unsafe { &mut *(self.0.as_ptr() as *mut TemplateObj) }
+    }
+
+    pub fn props<'a>(self) -> &'a mut PropsObj {
+        debug_assert_eq!(self.kind(), Kind::Props);
+        unsafe { &mut *(self.0.as_ptr() as *mut PropsObj) }
+    }
+
     pub fn host<'a>(self) -> &'a mut HostObj {
         debug_assert_eq!(self.kind(), Kind::Host);
         unsafe { &mut *(self.0.as_ptr() as *mut HostObj) }
@@ -225,6 +258,21 @@ pub fn trace_children(obj: Obj, f: &mut dyn FnMut(Value)) {
             }
         }
         Kind::Cell => f(obj.cell().value),
+        Kind::Signal => {
+            let s = obj.signal();
+            f(s.value);
+            for sub in &s.subs {
+                f(Value::Obj(*sub));
+            }
+        }
+        Kind::Reactive => obj.reactive().trace(f),
+        Kind::Template => obj.template().trace(f),
+        Kind::Props => {
+            let p = obj.props();
+            f(p.statics);
+            f(p.dynamics);
+            f(p.children);
+        }
         Kind::Fiber => obj.fiber().fiber.trace(f),
         Kind::Promise => {
             let p = obj.promise();
@@ -255,6 +303,10 @@ pub unsafe fn drop_object(hdr: *mut Header) {
             Kind::Fiber => std::ptr::drop_in_place(hdr as *mut FiberObj),
             Kind::Promise => std::ptr::drop_in_place(hdr as *mut PromiseObj),
             Kind::Host => std::ptr::drop_in_place(hdr as *mut HostObj),
+            Kind::Signal => std::ptr::drop_in_place(hdr as *mut SignalObj),
+            Kind::Reactive => std::ptr::drop_in_place(hdr as *mut ReactiveObj),
+            Kind::Template => std::ptr::drop_in_place(hdr as *mut TemplateObj),
+            Kind::Props => std::ptr::drop_in_place(hdr as *mut PropsObj),
             Kind::Cell | Kind::Range => {}
         }
     }
