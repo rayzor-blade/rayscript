@@ -6,4 +6,5 @@ license.workspace = true
 description = "RayScript's compiler to bytecode, and the VM that runs it in fibers."
 
 [dependencies]
+rayscript-gc.workspace = true
 rayscript-syntax.workspace = true

@@ -70,3 +70,13 @@ impl Vm {
         self.heap.stats()
     }
 }
+
+impl Drop for Vm {
+    /// An empty collection frees every object and runs the destructors of those that own Rust memory.
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            self.heap.begin_collect();
+            self.heap.end_collect(|h| unsafe { drop_object(h) });
+        }
+    }
+}

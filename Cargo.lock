@@ -21,6 +21,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rayscript-gc"
+version = "0.1.0"
+
+[[package]]
 name = "rayscript-syntax"
 version = "0.1.0"
 dependencies = [
@@ -31,6 +35,7 @@ dependencies = [
 name = "rayscript-vm"
 version = "0.1.0"
 dependencies = [
+ "rayscript-gc",
  "rayscript-syntax",
 ]
 

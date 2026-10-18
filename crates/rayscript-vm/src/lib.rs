@@ -3,7 +3,7 @@
 pub mod bytecode;
 pub mod compiler;
 pub mod fiber;
-pub mod heap;
+pub use rayscript_gc as heap;
 pub mod object;
 pub mod stdlib;
 pub mod value;
