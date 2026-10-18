@@ -101,9 +101,14 @@ impl Vm {
                 throw!(e)
             }};
         }
-        // A poll: the budget, a cancel, the heap, and an allocation the heap refused.
+        // A poll: the budget, a cancel, the heap, and an allocation the heap refused. At a jump the fiber
+        // goes on from where it is; before an instruction that has not run yet (`poll_op`), a fiber that
+        // gives up its turn goes on from that instruction, not the one after it.
         macro_rules! poll {
-            () => {{
+            () => {
+                poll!(0)
+            };
+            ($back:expr) => {{
                 if self.oom {
                     self.oom = false;
                     save_pc!();
@@ -114,7 +119,7 @@ impl Vm {
                     return Exit::Cancelled;
                 }
                 if budget.fuel == 0 {
-                    save_pc!();
+                    f!().frames[frame_idx].pc = pc - $back;
                     return Exit::Yield;
                 }
                 budget.fuel -= 1;
@@ -122,7 +127,7 @@ impl Vm {
                 if budget.polls & 63 == 0 {
                     if let Some(d) = budget.deadline {
                         if std::time::Instant::now() >= d {
-                            save_pc!();
+                            f!().frames[frame_idx].pc = pc - $back;
                             return Exit::Yield;
                         }
                     }
@@ -163,7 +168,7 @@ impl Vm {
         macro_rules! do_call {
             ($slot:expr, $argc:expr) => {{
                 let (slot, argc): (usize, usize) = ($slot, $argc);
-                poll!();
+                poll!(1);
                 let callee = f!().stack[slot];
                 match callee {
                     Value::Obj(c) if c.kind() == Kind::Closure => {
@@ -427,7 +432,7 @@ impl Vm {
                             }
                         }
                     }
-                    poll!();
+                    poll!(1);
                     match self.methods.get(&(ops::kind_tag(recv), sym)).copied() {
                         Some(id) => native_call!(id, slot, argc as usize + 1, slot),
                         None => {

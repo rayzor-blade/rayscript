@@ -119,3 +119,37 @@ for (f in fs) s += await f;
 return s;";
     assert_eq!(run(src), "39800");
 }
+
+/// Whatever the budget, a fiber that gives up its turn goes on from where it stopped: at a call as much as
+/// at a jump, so a call is never skipped and never made twice.
+#[test]
+fn a_fiber_that_runs_out_of_fuel_resumes_exactly_where_it_stopped() {
+    let src = "var calls = 0;
+               function f(x) { calls++; return x * 2; }
+               var s = 0;
+               for (i in 0...30) { s += f(i); s += [i].map(v -> f(v)).length; }
+               var o = {k: f(1)};
+               return [s, calls, o.k, 'x'.toUpperCase()].join(',');";
+    let want = {
+        let mut vm = Vm::new();
+        let r = vm.run_source("t.rays", src).unwrap();
+        vm.display(r)
+    };
+    assert_eq!(want, "900,61,2,X");
+    for fuel in 1..=60u64 {
+        let mut vm = Vm::new();
+        let parsed = rayscript_syntax::parse(src);
+        let module = rayscript_vm::compile("t.rays", src, &parsed.module).unwrap();
+        let id = vm.load(&module);
+        let fiber = vm.spawn_main(id).unwrap();
+        let mut turns = 0;
+        while !matches!(vm.fiber_state(fiber), Some(FiberState::Done)) {
+            let mut budget = Budget::fuel(fuel);
+            vm.run(fiber, &mut budget);
+            turns += 1;
+            assert!(turns < 100_000, "fuel {fuel}: never ended");
+        }
+        let got = vm.display(vm.fiber_result(fiber).unwrap());
+        assert_eq!(got, want, "with {fuel} polls to a turn");
+    }
+}
