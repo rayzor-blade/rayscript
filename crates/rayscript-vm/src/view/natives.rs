@@ -49,7 +49,7 @@ pub(super) fn install(vm: &mut Vm) {
                 owner.reactive().cleanups.push(func);
                 Ok(Value::Nil)
             }
-            None => throw(vm, "onCleanup belongs inside a component or an effect"),
+            None => throw(vm, "onCleanup must be called inside a component or an effect"),
         }
     });
     vm.define_native("flush", |vm, _| {
@@ -63,7 +63,7 @@ pub(super) fn install(vm: &mut Vm) {
     });
     vm.define_native("unmount", |vm, args| match arg(args, 0) {
         Value::Int(id) => Ok(Value::Bool(vm.view_unmount(id as u32))),
-        _ => throw(vm, "unmount needs the number mount gave"),
+        _ => throw(vm, "unmount requires the id mount returned"),
     });
 
     // What markup compiles to.

@@ -426,3 +426,64 @@ fn a_script_can_title_its_view() {
     let titles: Vec<String> = e.of_kind("view").iter().map(|m| e.text(m, "title")).collect();
     assert_eq!(titles, ["Notes (3)", "He said \"hi\""]);
 }
+
+#[test]
+fn a_hook_reaches_every_handler_that_listens_and_the_editor_is_told_once() {
+    let mut e = Editor::new();
+    e.run(
+        "var seen = signal('none'); var count = signal(0);
+         onHook('file.saved', (d) -> seen.value = d.path);
+         onHook('file.saved', (d) -> count.value++);
+         onHook('active.changed', (d) -> count.value = count.value + 10);
+         mount(() -> <p>{seen} {count}</p>);",
+    );
+    e.settle();
+    let subscribed: Vec<String> = e.of_kind("subscribe").iter().map(|m| e.text(m, "hook")).collect();
+    assert_eq!(subscribed, ["file.saved", "active.changed"]);
+    e.send("{\"t\":\"hook\",\"name\":\"file.saved\",\"data\":{\"path\":\"a.md\"}}");
+    e.send("{\"t\":\"hook\",\"name\":\"nobody.listens\",\"data\":{}}");
+    e.settle();
+    assert_eq!(e.html(), "<p>a.md 1</p>");
+    e.send("{\"t\":\"hook\",\"name\":\"active.changed\"}");
+    e.send("{\"t\":\"hook\"}");
+    e.settle();
+    assert_eq!(e.html(), "<p>a.md 11</p>");
+    assert_eq!(e.of_kind("error").len(), 1);
+}
+
+#[test]
+fn a_registered_command_runs_with_its_arguments() {
+    let mut e = Editor::new();
+    e.run("var out = signal(''); registerCommand('preview', (a) -> out.value = a.file + ':' + a.line); mount(() -> <p>{out}</p>);");
+    e.settle();
+    let registered = e.of_kind("registered");
+    assert_eq!(registered.len(), 1);
+    assert_eq!(e.text(registered[0], "id"), "preview");
+    e.send("{\"t\":\"command\",\"id\":\"preview\",\"args\":{\"file\":\"README.md\",\"line\":3}}");
+    e.settle();
+    assert_eq!(e.html(), "<p>README.md:3</p>");
+    e.no_errors();
+    e.send("{\"t\":\"command\",\"id\":\"missing\"}");
+    e.settle();
+    let errors = e.of_kind("error");
+    assert_eq!(errors.len(), 1);
+    assert!(e.text(errors[0], "message").contains("registerCommand('missing'"));
+}
+
+#[test]
+fn a_tab_view_is_unmounted_when_the_editor_closes_it() {
+    let mut e = Editor::new();
+    e.run("mount(() -> <b>one</b>, 'tab:Preview of a.md'); mount(() -> <i>two</i>, 'tab:Preview of b.md');");
+    e.settle();
+    assert_eq!(e.roots.len(), 2);
+    assert_eq!(e.dom.prop(e.roots[0], "name"), Some(&PropValue::Str("tab:Preview of a.md".into())));
+    let first = e.roots[0];
+    e.send(&format!("{{\"t\":\"closed\",\"root\":{first}}}"));
+    e.settle();
+    assert_eq!(e.dom.inner(e.roots[1]), "<i>two</i>");
+    assert!(e.dom.find(first, "b").is_empty(), "the closed view's elements are gone");
+    e.send("{\"t\":\"describe\"}");
+    e.settle();
+    let d = e.of_kind("describe")[0];
+    assert_eq!(e.reader.display(e.field(d, "mounts")).matches("tab:").count(), 1);
+}

@@ -15,6 +15,13 @@
 //! - `{"t":"event","node":7,"event":"click","payload":...}` sends an event to the handler of an element.
 //!   The payload is any JSON value, and is what the handler is called with.
 //! - `{"t":"resolve","id":3,"value":...}` and `{"t":"reject","id":3,"message":"..."}` answer a `call`.
+//! - `{"t":"hook","name":"file.saved","data":{...}}` is an IDE signal. Each handler the script gave
+//!   `onHook("file.saved", handler)` runs with `data`. Hooks nothing listens to are dropped, and the host tells
+//!   the editor which are listened to (`subscribe`), so the editor need only send those.
+//! - `{"t":"command","id":"preview","args":{...}}` runs the handler the script gave
+//!   `registerCommand("preview", handler)`, with `args`. Without one, an `error` of kind `view` says so.
+//! - `{"t":"closed","root":3}` says the view the script mounted as root 3 has been closed, as a tab is: the
+//!   host unmounts it.
 //! - `{"t":"tool","id":"add"}` says a tool of the extension's header was chosen: the handler the script
 //!   gave `onTool("add", handler)` runs. Without one, an `error` of kind `view` says so.
 //! - `{"t":"describe"}` asks what the host is doing.
@@ -34,6 +41,8 @@
 //!   `name` property; the editor puts it where the name says.
 //! - `{"t":"call","id":3,"fn":"rayde.workspace.say","args":[...]}` calls a function of a remote module.
 //!   Answer with `resolve` or `reject`. Operations the script has made before the call are sent before it.
+//! - `{"t":"subscribe","hook":"file.saved"}` the first time a script listens for a hook.
+//! - `{"t":"registered","id":"preview"}` when a script registers a command.
 //! - `{"t":"view","title":"..."}` when the script called `setTitle(text)`: the heading of the extension's view.
 //! - `{"t":"log","message":"..."}` is what the script `trace`d.
 //! - `{"t":"error","kind":"syntax"|"compile"|"runtime"|"view"|"protocol","message":"...","items":[...]}`
@@ -42,7 +51,8 @@
 //! - `{"t":"describe","mounts":[...],"nodes":n,...}` answers `describe`.
 //!
 //! A script may `sleep(milliseconds)`, which is a promise too, `onTool(id, handler)` to answer a tool of its
-//! header, and `setTitle(text)` to change the heading of its view.
+//! header, `onHook(name, handler)` and `registerCommand(id, handler)`, and `setTitle(text)` to change the
+//! heading of its view. A view mounted with a name that begins `tab:` is meant for a tab, titled by the rest.
 
 pub mod wire;
 
@@ -136,6 +146,8 @@ pub struct Host {
     modules: Rc<RefCell<HashMap<String, Vec<String>>>>,
     timers: Rc<RefCell<BinaryHeap<Reverse<(Instant, u64)>>>>,
     tools: Rc<RefCell<HashMap<String, Value>>>,
+    hooks: Rc<RefCell<HashMap<String, Vec<Value>>>>,
+    commands: Rc<RefCell<HashMap<String, Value>>>,
     scripts: Vec<(String, Value, bool)>,
     shutdown: bool,
     ops_sent: u64,
@@ -177,11 +189,46 @@ impl Host {
             let tools = tools.clone();
             vm.define_native("onTool", move |vm, args| {
                 let (Some(id), Some(handler)) = (args.first().and_then(|v| vm.string_of(*v)).map(str::to_string), args.get(1).copied()) else {
-                    return Err(vm.new_string("onTool needs the id of a tool and a function"));
+                    return Err(vm.new_string("onTool requires a tool id and a handler"));
                 };
                 // The handler is kept for the life of the extension.
                 vm.root(handler);
                 tools.borrow_mut().insert(id, handler);
+                Ok(Value::Nil)
+            });
+        }
+        let hooks: Rc<RefCell<HashMap<String, Vec<Value>>>> = Rc::new(RefCell::new(HashMap::new()));
+        {
+            let (hooks, out) = (hooks.clone(), out.clone());
+            vm.define_native("onHook", move |vm, args| {
+                let (Some(name), Some(handler)) = (args.first().and_then(|v| vm.string_of(*v)).map(str::to_string), args.get(1).copied()) else {
+                    return Err(vm.new_string("onHook requires a hook name and a handler"));
+                };
+                vm.root(handler);
+                let first = !hooks.borrow().contains_key(&name);
+                if first {
+                    let mut line = String::from("{\"t\":\"subscribe\",\"hook\":");
+                    quote(&name, &mut line);
+                    line.push('}');
+                    out.borrow_mut().push(line);
+                }
+                hooks.borrow_mut().entry(name).or_default().push(handler);
+                Ok(Value::Nil)
+            });
+        }
+        let commands: Rc<RefCell<HashMap<String, Value>>> = Rc::new(RefCell::new(HashMap::new()));
+        {
+            let (commands, out) = (commands.clone(), out.clone());
+            vm.define_native("registerCommand", move |vm, args| {
+                let (Some(id), Some(handler)) = (args.first().and_then(|v| vm.string_of(*v)).map(str::to_string), args.get(1).copied()) else {
+                    return Err(vm.new_string("registerCommand requires a command id and a handler"));
+                };
+                vm.root(handler);
+                let mut line = String::from("{\"t\":\"registered\",\"id\":");
+                quote(&id, &mut line);
+                line.push('}');
+                out.borrow_mut().push(line);
+                commands.borrow_mut().insert(id, handler);
                 Ok(Value::Nil)
             });
         }
@@ -197,7 +244,7 @@ impl Host {
             });
         }
         let slice = if config.slice.is_zero() { Duration::from_millis(4) } else { config.slice };
-        Host { vm, out, modules, timers, tools, scripts: Vec::new(), shutdown: false, ops_sent: 0, slice }
+        Host { vm, out, modules, timers, tools, hooks, commands, scripts: Vec::new(), shutdown: false, ops_sent: 0, slice }
     }
 
     pub fn vm(&mut self) -> &mut Vm {
@@ -257,12 +304,12 @@ impl Host {
             Ok(m) => m,
             Err(e) => {
                 let text = self.vm.display(e);
-                self.error("protocol", &format!("that line is not JSON: {text}"), "");
+                self.error("protocol", &format!("Invalid JSON: {text}"), "");
                 return;
             }
         };
         let Some(kind) = self.string_field(msg, "t") else {
-            self.error("protocol", "a message needs a \"t\" that says what it is", "");
+            self.error("protocol", "Message has no \"t\" field", "");
             return;
         };
         match kind.as_str() {
@@ -270,7 +317,7 @@ impl Host {
                 let name = self.string_field(msg, "name").unwrap_or_else(|| "main.rays".into());
                 match self.string_field(msg, "source") {
                     Some(source) => self.run(&name, &source),
-                    None => self.error("protocol", "`run` needs a \"source\"", ""),
+                    None => self.error("protocol", "`run` requires \"source\"", ""),
                 }
             }
             "module" => match (self.string_field(msg, "path"), self.vm.get_member(msg, "functions")) {
@@ -278,11 +325,11 @@ impl Host {
                     let names: Vec<String> = list.array().items.iter().filter_map(|v| self.vm.string_of(*v).map(str::to_string)).collect();
                     self.modules.borrow_mut().insert(path, names);
                 }
-                _ => self.error("protocol", "`module` needs a \"path\" and a list of \"functions\"", ""),
+                _ => self.error("protocol", "`module` requires \"path\" and \"functions\"", ""),
             },
             "event" => {
                 let (Some(node), Some(event)) = (self.int_field(msg, "node"), self.string_field(msg, "event")) else {
-                    self.error("protocol", "`event` needs a \"node\" and an \"event\"", "");
+                    self.error("protocol", "`event` requires \"node\" and \"event\"", "");
                     return;
                 };
                 let payload = self.vm.get_member(msg, "payload").unwrap_or(Value::Nil);
@@ -291,7 +338,7 @@ impl Host {
             }
             "resolve" | "reject" => {
                 let Some(id) = self.int_field(msg, "id") else {
-                    self.error("protocol", &format!("`{kind}` needs the \"id\" of a call"), "");
+                    self.error("protocol", &format!("`{kind}` requires the call \"id\""), "");
                     return;
                 };
                 let settled = if kind == "resolve" {
@@ -303,7 +350,7 @@ impl Host {
                     self.vm.reject(id as u64, thrown)
                 };
                 if !settled {
-                    self.error("protocol", &format!("no call is waiting for id {id}"), "");
+                    self.error("protocol", &format!("No pending call with id {id}"), "");
                 }
             }
             "tool" => match self.string_field(msg, "id") {
@@ -313,14 +360,45 @@ impl Host {
                         Some(h) => {
                             self.vm.view_spawn_handler(h, &[]);
                         }
-                        None => self.error("view", &format!("the extension has no handler for the tool `{id}`: write onTool('{id}', () -> ...)"), ""),
+                        None => self.error("view", &format!("No handler registered for tool `{id}`; register one with onTool('{id}', handler)"), ""),
                     }
                 }
-                None => self.error("protocol", "`tool` needs the \"id\" of a tool", ""),
+                None => self.error("protocol", "`tool` requires \"id\"", ""),
+            },
+            "hook" => {
+                let Some(name) = self.string_field(msg, "name") else {
+                    self.error("protocol", "`hook` requires \"name\"", "");
+                    return;
+                };
+                let data = self.vm.get_member(msg, "data").unwrap_or(Value::Nil);
+                let handlers = self.hooks.borrow().get(&name).cloned().unwrap_or_default();
+                for h in handlers {
+                    self.vm.view_spawn_handler(h, &[data]);
+                }
+            }
+            "command" => {
+                let Some(id) = self.string_field(msg, "id") else {
+                    self.error("protocol", "`command` requires \"id\"", "");
+                    return;
+                };
+                let args = self.vm.get_member(msg, "args").unwrap_or(Value::Nil);
+                let handler = self.commands.borrow().get(&id).copied();
+                match handler {
+                    Some(h) => {
+                        self.vm.view_spawn_handler(h, &[args]);
+                    }
+                    None => self.error("view", &format!("No command registered with id `{id}`; register one with registerCommand('{id}', handler)"), ""),
+                }
+            }
+            "closed" => match self.int_field(msg, "root") {
+                Some(root) => {
+                    self.vm.view_unmount(root as u32);
+                }
+                None => self.error("protocol", "`closed` requires \"root\"", ""),
             },
             "describe" => self.describe(),
             "shutdown" => self.shutdown = true,
-            other => self.error("protocol", &format!("unknown message `{other}`"), ""),
+            other => self.error("protocol", &format!("Unknown message type `{other}`"), ""),
         }
     }
 
@@ -344,8 +422,22 @@ impl Host {
             }
             quote(m, &mut names);
         }
+        let list = |names: Vec<String>| {
+            let mut sorted = names;
+            sorted.sort();
+            let mut out = String::new();
+            for (i, n) in sorted.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                quote(n, &mut out);
+            }
+            out
+        };
+        let hooks = list(self.hooks.borrow().keys().cloned().collect());
+        let commands = list(self.commands.borrow().keys().cloned().collect());
         let line = format!(
-            "{{\"t\":\"describe\",\"protocol\":{PROTOCOL},\"mounts\":[{mounts}],\"nodes\":{},\"fibers\":{},\"pendingCalls\":{},\"timers\":{},\"opsSent\":{},\"remoteModules\":[{names}],\"heap\":{{\"objects\":{},\"bytes\":{},\"collections\":{}}}}}",
+            "{{\"t\":\"describe\",\"protocol\":{PROTOCOL},\"mounts\":[{mounts}],\"nodes\":{},\"fibers\":{},\"pendingCalls\":{},\"timers\":{},\"opsSent\":{},\"remoteModules\":[{names}],\"hooks\":[{hooks}],\"commands\":[{commands}],\"heap\":{{\"objects\":{},\"bytes\":{},\"collections\":{}}}}}",
             self.vm.view_node_count(),
             self.vm.fiber_count(),
             self.vm.pending_count(),
