@@ -166,3 +166,41 @@ fn script_fibers_execute_on_distinct_stable_krio_stacks() {
     "#).unwrap();
     assert_eq!(vm.display(result), "[true,true,true]");
 }
+
+#[test]
+fn cancel_all_stops_waiting_and_runnable_fibers() {
+    let mut vm = Vm::new();
+    let (gate, id) = vm.new_promise();
+    vm.define_global("gate", gate);
+    let waiting = vm.start_source("waiting.rays", "var child = spawn(() -> { await gate; }); await gate;").unwrap();
+    vm.root(waiting);
+    let running = vm.start_source("running.rays", "while (true) { yield(); }").unwrap();
+    vm.root(running);
+    vm.tick(1000);
+    vm.tick(1000);
+    assert_eq!(vm.fiber_count(), 3);
+    vm.cancel_all();
+    vm.run_until_idle(1000);
+    assert_eq!(vm.fiber_count(), 0);
+    assert_eq!(vm.fiber_state(waiting), Some(FiberState::Cancelled));
+    assert_eq!(vm.fiber_state(running), Some(FiberState::Cancelled));
+    vm.collect();
+    assert!(vm.resolve(id, Value::Nil));
+    vm.run_until_idle(1000);
+    assert_eq!(vm.fiber_count(), 0);
+}
+
+#[test]
+fn cancel_all_releases_a_debugger_paused_fiber() {
+    let mut vm = Vm::new();
+    vm.debug_set_breakpoints("paused.rays", &[2]);
+    let fiber = vm.start_source("paused.rays", "var n = 1;\nn = n + 1;\n").unwrap();
+    vm.root(fiber);
+    vm.run_until_idle(1000);
+    assert!(vm.debug_paused().is_some());
+    vm.cancel_all();
+    vm.run_until_idle(1000);
+    assert!(vm.debug_paused().is_none());
+    assert_eq!(vm.fiber_state(fiber), Some(FiberState::Cancelled));
+    assert_eq!(vm.fiber_count(), 0);
+}

@@ -150,6 +150,7 @@ impl Vm {
             std::mem::take(&mut f.waiters)
         };
         self.fibers.retain(|x| *x != o);
+        self.view.fiber_roots.remove(&o);
         if state == FiberState::Failed && o.fiber().fiber.detached && waiters.is_empty() {
             let text = self.render_failure(Value::Obj(o));
             if let Some(f) = o.fiber().fiber.failure.clone() {

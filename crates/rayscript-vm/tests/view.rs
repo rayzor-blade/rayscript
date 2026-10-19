@@ -459,3 +459,24 @@ fn random_list_updates_match_a_fresh_draw() {
         }
     });
 }
+
+#[test]
+fn unmount_cancels_waiting_event_fibers_and_their_children_only() {
+    each(|h| {
+        let (gate, id) = h.vm.new_promise();
+        h.vm.define_global("gate", gate);
+        let log = h.run("var log = []; mount(() -> { onCleanup(() -> log.push('cleanup')); return <div><button onClick={() -> { spawn(() -> { await gate; log.push('child'); }); await gate; log.push('first'); }}>one</button></div>; }, 'one'); mount(() -> <button onClick={() -> { await gate; log.push('second'); }}>two</button>, 'two'); return log;");
+        let buttons = [h.dom.find(h.roots[0], "button")[0], h.dom.find(h.roots[1], "button")[0]];
+        h.click(buttons[0]);
+        h.click(buttons[1]);
+        assert_eq!(h.vm.fiber_count(), 3);
+        assert!(h.vm.view_unmount(h.roots[0]));
+        h.settle();
+        assert_eq!(h.vm.fiber_count(), 1);
+        h.vm.collect();
+        assert!(h.vm.resolve(id, Value::Nil));
+        h.settle();
+        assert_eq!(h.vm.display(log), "[cleanup,second]");
+        assert_eq!(h.vm.fiber_count(), 0);
+    });
+}

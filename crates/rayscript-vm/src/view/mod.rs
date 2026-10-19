@@ -113,6 +113,8 @@ pub(crate) struct ViewState {
     pub mounts: Vec<Mount>,
     /// Fibers running event handlers, until they end.
     pub handlers: Vec<Obj>,
+    /// Mounted root owning each live view fiber and its spawned children.
+    pub fiber_roots: HashMap<Obj, u32>,
     /// When a flush must stop, leaving the rest of the effects queued.
     pub deadline: Option<std::time::Instant>,
 }
@@ -276,6 +278,11 @@ impl Vm {
     pub fn view_unmount(&mut self, root: u32) -> bool {
         let Some(at) = self.view.mounts.iter().position(|m| m.root == root) else { return false };
         let m = self.view.mounts.remove(at);
+        let handlers: Vec<Obj> = self.view.fiber_roots.iter()
+            .filter_map(|(fiber, owner)| (*owner == root).then_some(*fiber)).collect();
+        for fiber in handlers {
+            self.cancel(Value::Obj(fiber));
+        }
         self.dispose(m.scope);
         self.remove_node(m.root);
         true
@@ -289,12 +296,20 @@ impl Vm {
             _ => None,
         };
         let Some(handler) = handler else { return false };
-        self.view_spawn_handler(handler, &[payload])
+        let mut root = node;
+        while let Some(parent) = self.view.nodes.get(&root).map(|n| n.parent).filter(|p| *p != 0) {
+            root = parent;
+        }
+        self.view_spawn_owned_handler(handler, &[payload], root)
     }
 
     /// Runs `handler` as an event handler does: as a fiber, whose failure is reported with the view's errors.
     /// A host function is called here and now; its answer, if it is a promise, is nobody's to wait for.
     pub fn view_spawn_handler(&mut self, handler: Value, args: &[Value]) -> bool {
+        self.view_spawn_owned_handler(handler, args, 0)
+    }
+
+    fn view_spawn_owned_handler(&mut self, handler: Value, args: &[Value], root: u32) -> bool {
         if matches!(handler, Value::Native(_)) {
             if let Err(e) = self.call(handler, args) {
                 self.view_error(e);
@@ -305,6 +320,7 @@ impl Vm {
             Ok(fiber) => {
                 if let Some(o) = fiber.as_obj() {
                     self.view.handlers.push(o);
+                    self.view.fiber_roots.insert(o, root);
                 }
                 true
             }

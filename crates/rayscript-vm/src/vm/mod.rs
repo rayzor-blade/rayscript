@@ -619,6 +619,9 @@ impl Vm {
             }
             _ => return Err(self.new_string("a fiber starts with a function")),
         }
+        if let Some(root) = self.current.and_then(|parent| self.view.fiber_roots.get(&parent).copied()) {
+            self.view.fiber_roots.insert(obj, root);
+        }
         self.fibers.push(obj);
         self.ready.push_back(obj);
         Ok(Value::Obj(obj))
@@ -682,12 +685,23 @@ impl Vm {
 
     /// Asks a fiber to stop at its next poll.
     pub fn cancel(&mut self, fiber: Value) {
+        if self.debug.paused.as_ref().is_some_and(|pause| Some(pause.fiber) == fiber.as_obj()) {
+            self.debug_resume(None);
+        }
         if let Some(o) = fiber.as_obj().filter(|o| o.kind() == Kind::Fiber) {
             o.fiber().fiber.cancelled = true;
             if o.fiber().fiber.state == FiberState::Waiting {
                 o.fiber().fiber.state = FiberState::Ready;
                 self.ready.push_back(o);
             }
+        }
+    }
+
+    /// Cancels all live script fibers at their next poll, including ones waiting on promises.
+    pub fn cancel_all(&mut self) {
+        let fibers = self.fibers.clone();
+        for fiber in fibers {
+            self.cancel(Value::Obj(fiber));
         }
     }
 
