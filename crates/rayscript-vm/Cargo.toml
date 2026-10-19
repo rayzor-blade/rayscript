@@ -8,3 +8,8 @@ description = "RayScript's compiler to bytecode, and the VM that runs it in fibe
 [dependencies]
 rayscript-gc.workspace = true
 rayscript-syntax.workspace = true
+libloading = "0.9"
+libffi = "5.2"
+
+[dev-dependencies]
+rayscript-ffi-fixture = { path = "../rayscript-ffi-fixture" }

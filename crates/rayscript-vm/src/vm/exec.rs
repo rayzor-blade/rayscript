@@ -646,7 +646,10 @@ impl Vm {
                         Err(e) => throw!(e),
                     }
                 }
-                Op::BindNative { .. } => fail!("native libraries are not available yet"),
+                Op::BindNative { dst, spec } => {
+                    let spec = match p!().consts[spec as usize] { Value::Obj(o) if o.kind() == Kind::String => o.str().to_owned(), _ => fail!("invalid native binding descriptor") };
+                    match self.bind_native(&spec) { Ok(value) => reg!(dst) = value, Err(error) => fail!("{error}") }
+                },
 
                 Op::Await { dst, src } => {
                     let v = reg!(src);

@@ -4,6 +4,7 @@
 
 mod debug;
 mod exec;
+mod ffi;
 mod gc;
 pub(crate) mod ops;
 mod sched;
@@ -80,6 +81,7 @@ pub(crate) struct LoadedModule {
 }
 
 pub struct Vm {
+    foreign: ffi::Libraries,
     pub(crate) heap: Heap,
     pub(crate) syms: Symbols,
     /// Boxed so a pointer to one stays good while more are loaded.
@@ -135,6 +137,7 @@ impl Vm {
 
     pub fn with_config(config: HeapConfig) -> Vm {
         let mut vm = Vm {
+            foreign: ffi::Libraries::default(),
             heap: Heap::new(config),
             syms: Symbols::default(),
             protos: Vec::new(),

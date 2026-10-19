@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/rayscript-syntax", "crates/rayscript-gc", "crates/rayscript-vm", "crates/rayscript-host", "crates/rayscript-cli"]
+members = ["crates/rayscript-syntax", "crates/rayscript-gc", "crates/rayscript-vm", "crates/rayscript-host", "crates/rayscript-cli", "crates/rayscript-ffi-fixture"]
 
 [workspace.package]
 version = "0.1.0"

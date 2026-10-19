@@ -403,7 +403,16 @@ impl Compiler {
     }
 
     fn native_block(&mut self, n: &ast::NativeBlock) {
+        if n.library.is_empty() || n.library.contains('\0') {
+            self.error(n.library_span, "a native library needs a nonempty name without NUL characters");
+            return;
+        }
         for f in &n.functions {
+            for param in &f.params {
+                if param.rest || param.optional || param.default.is_some() {
+                    self.error(param.span, format!("{}.{}: native arguments cannot be optional, variadic or have defaults", n.library, f.name.name));
+                }
+            }
             self.at(f.span);
             let ty = |t: &Option<ast::Type>| t.as_ref().map(rayscript_syntax::dump::ty).unwrap_or_else(|| "Void".to_string());
             let sig = format!("{}->{}", f.params.iter().map(|p| ty(&p.ty)).collect::<Vec<_>>().join(","), ty(&f.ret));

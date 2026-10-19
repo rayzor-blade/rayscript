@@ -119,10 +119,11 @@ fn main() {
 | `rayscript-gc` | Garbage-collected heap used by the VM. |
 | `rayscript-host` | `rayscript-host`: runs one extension in its own process and talks to the editor in JSON lines. |
 | `rayscript-cli` | The `rayscript` command. |
+| `rayscript-ffi-fixture` | Shared C-ABI library built for native-call tests. |
 
 ## Status
 
-- `native "lib" { function f(a:Int):Int; }` parses and compiles; loading libraries is not implemented yet.
+- [Native calls](docs/native.md) bind scalar C functions from libraries explicitly registered by the embedding application. Pointers, handles, structs and callbacks are not implemented yet.
 - No release yet; build from source with `cargo build --release`. `cargo test` runs the suite.
 
 MIT OR Apache-2.0.

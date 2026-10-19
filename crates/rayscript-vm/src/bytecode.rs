@@ -104,7 +104,7 @@ pub enum Op {
     Import { dst: Reg, path: u32 },
     /// Every member of a host module as a global, for `import a.b.*`.
     ImportAll { path: u32 },
-    /// A function of a native library: the constant is `library\0name\0signature`.
+    /// A function of a native library: the constant is `library\0name\0signature\0flags`.
     BindNative { dst: Reg, spec: u32 },
 
     /// Pattern tests: whether `src` is an array of exactly (or at least) `len` elements, an object, or has a field.
