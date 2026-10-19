@@ -108,12 +108,11 @@ pub struct Vm {
     pub(crate) oom: bool,
     /// Set by a native that wants the fiber that called it to give up its turn.
     pub(crate) yield_flag: bool,
+    pub(crate) native_pending: Option<Value>,
     /// Values the host keeps alive.
     pub(crate) roots: Vec<Value>,
-    /// How deep a native's call back into script is; a fiber cannot suspend inside one.
+    /// Depth of native-to-script calls; callbacks may wait on native lanes, but not host promises.
     pub(crate) nested: u32,
-    /// The stack position of the outermost call a native made back into script.
-    pub(crate) nested_base: usize,
     pub(crate) collections: usize,
     pub(crate) view: crate::view::ViewState,
     pub(crate) trace_sink: Option<Rc<dyn Fn(&str)>>,
@@ -156,9 +155,9 @@ impl Vm {
             next_id: 1,
             oom: false,
             yield_flag: false,
+            native_pending: None,
             roots: Vec::new(),
             nested: 0,
-            nested_base: 0,
             collections: 0,
             view: Default::default(),
             trace_sink: None,
@@ -494,6 +493,7 @@ impl Vm {
     pub fn run_source(&mut self, name: &str, source: &str) -> Result<Value, String> {
         let fiber = self.start_source(name, source)?;
         self.run_until_idle(10_000);
+        while self.fiber_state(fiber) == Some(FiberState::Waiting) && self.native_waits_for(fiber) { self.wait_native(); self.run_until_idle(10_000); }
         match self.fiber_state(fiber) {
             Some(FiberState::Done) => Ok(self.fiber_result(fiber).unwrap_or(Value::Nil)),
             Some(FiberState::Failed) => Err(self.render_failure(fiber)),

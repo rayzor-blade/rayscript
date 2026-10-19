@@ -728,26 +728,33 @@ impl Host {
 enum Input {
     Line(String),
     End,
+    NativeWake,
 }
 
 /// Serves the protocol on `input` and `output` until the editor shuts the host down or closes the input.
 /// Run it on a thread with a stack of 16 MiB or more.
-pub fn serve<R: BufRead + Send + 'static, W: Write>(input: R, mut output: W, config: Config) -> io::Result<()> {
+pub fn serve<R: BufRead + Send + 'static, W: Write>(input: R, output: W, config: Config) -> io::Result<()> {
+    serve_host(input, output, Host::new(config))
+}
+
+/// Serves an embedder-configured host, including its explicitly registered native libraries.
+pub fn serve_host<R: BufRead + Send + 'static, W: Write>(input: R, mut output: W, mut host: Host) -> io::Result<()> {
     let (tx, rx) = mpsc::channel();
+    let input_tx = tx.clone();
     std::thread::spawn(move || {
         for line in input.lines() {
             match line {
                 Ok(l) => {
-                    if tx.send(Input::Line(l)).is_err() {
+                    if input_tx.send(Input::Line(l)).is_err() {
                         return;
                     }
                 }
                 Err(_) => break,
             }
         }
-        let _ = tx.send(Input::End);
+        let _ = input_tx.send(Input::End);
     });
-    let mut host = Host::new(config);
+    host.vm.set_native_waker(std::sync::Arc::new(move || { let _ = tx.send(Input::NativeWake); }));
     writeln!(output, "{{\"t\":\"ready\",\"protocol\":{PROTOCOL}}}")?;
     output.flush()?;
     let mut ended = false;
@@ -755,6 +762,7 @@ pub fn serve<R: BufRead + Send + 'static, W: Write>(input: R, mut output: W, con
         loop {
             match rx.try_recv() {
                 Ok(Input::Line(l)) => host.handle_line(&l),
+                Ok(Input::NativeWake) => {},
                 Ok(Input::End) | Err(mpsc::TryRecvError::Disconnected) => {
                     ended = true;
                     break;
@@ -776,6 +784,7 @@ pub fn serve<R: BufRead + Send + 'static, W: Write>(input: R, mut output: W, con
         };
         match received {
             Ok(Input::Line(l)) => host.handle_line(&l),
+            Ok(Input::NativeWake) => {},
             Ok(Input::End) | Err(mpsc::RecvTimeoutError::Disconnected) => ended = true,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }

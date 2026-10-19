@@ -253,8 +253,8 @@ fn binding_and_call_errors_name_the_library_symbol_and_argument() {
             ("function add(a:Void, b:Int):Int;", "Void is only a result"),
             ("function add(a, b:Int):Int;", "each native argument needs"),
             (
-                "@:blocking function add(a:Int, b:Int):Int;",
-                "not available yet",
+                "@:unavailable function add(a:Int, b:Int):Int;",
+                "not available",
             ),
             ("function add(?a:Int, b:Int):Int;", "optional, variadic"),
             ("function add(a:Int = 1, b:Int):Int;", "optional, variadic"),
@@ -1736,5 +1736,318 @@ fn byte_backed_structs_trace_callback_fields_and_share_retainers_across_views() 
             )
             .unwrap();
         assert_eq!(vm.display(result), "[28,true,bytes]");
+    });
+}
+
+#[test]
+fn blocking_calls_park_script_fibers_and_wake_the_host() {
+    with_vm(|vm| {
+        unsafe {
+            vm.register_native_library("control", rayscript_ffi_fixture::LIBRARY_PATH);
+        }
+        let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let copy = wakes.clone();
+        vm.set_native_waker(std::sync::Arc::new(move || {
+            copy.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let result = vm.run_source("blocking.rays", r#"
+            native "fixture" { @:blocking function gated_value(gate:SizeT, value:Int64):Int64; }
+            native "control" { function release_gate(gate:SizeT):Void; }
+            var completed = false;
+            var task = spawn(() -> { var value = gated_value(1, 42); completed = true; return value; });
+            yield();
+            var before = completed;
+            release_gate(1);
+            return [before, await task, completed];
+        "#).unwrap();
+        assert_eq!(vm.display(result), "[false,42,true]");
+        assert!(wakes.load(std::sync::atomic::Ordering::SeqCst) > 0);
+    });
+}
+
+#[test]
+fn worker_callbacks_run_on_the_vm_and_support_same_lane_reentry() {
+    with_vm(|vm| {
+        let vm_thread = std::thread::current().id();
+        vm.define_native("on_vm", move |_, _| {
+            assert_eq!(std::thread::current().id(), vm_thread);
+            Ok(Value::Bool(true))
+        });
+        let result = vm
+            .run_source(
+                "worker-callback.rays",
+                r#"
+            native "fixture" {
+                @:failure(-7) callback Visit(value:Int32, data:Ptr):Int32;
+                @:blocking function visit(cb:Visit, data:Ptr, count:Int32):Int32;
+            }
+            var depth = 0; var cb = null; var checked = false;
+            cb = Visit((value,data) -> {
+                checked = on_vm(); gc();
+                if (depth == 2) return 3;
+                depth++; var value = visit(cb, null, 2); depth--;
+                return value;
+            });
+            return [visit(cb, null, 2), checked];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(vm.display(result), "[24,true]");
+    });
+}
+
+#[test]
+fn callbacks_from_foreign_c_threads_marshal_to_the_vm() {
+    with_vm(|vm| {
+        let vm_thread = std::thread::current().id();
+        vm.define_native("on_vm", move |_, _| {
+            assert_eq!(std::thread::current().id(), vm_thread);
+            Ok(Value::Int(19))
+        });
+        let result = vm
+            .run_source(
+                "foreign-worker-callback.rays",
+                r#"
+            native "fixture" {
+                @:failure(-7) callback Visit(value:Int32, data:Ptr):Int32;
+                @:blocking function callback_worker(cb:Visit):Int32;
+            }
+            return callback_worker(Visit((value,data) -> { gc(); return on_vm() + value; }));
+        "#,
+            )
+            .unwrap();
+        assert_eq!(vm.display(result), "26");
+    });
+}
+
+#[test]
+fn worker_callback_errors_rethrow_after_c_and_outputs_decode() {
+    with_vm(|vm| {
+        let result = vm.run_source("worker-error.rays", r#"
+            native "fixture" {
+                @:failure(-7) callback Visit(value:Int32, data:Ptr):Int32;
+                @:blocking function visit_output(out:Out<Int32>, cb:Visit):Void;
+            }
+            var token = {message:'failure'}; var same = false; var out = Out(Int32);
+            try { visit_output(out, Visit((v,d) -> { gc(); throw token; })); } catch(e) { same = e == token; }
+            return [same, out.value];
+        "#).unwrap();
+        assert_eq!(vm.display(result), "[true,11]");
+    });
+}
+
+#[test]
+fn worker_buffers_are_busy_to_other_fibers_until_completion() {
+    with_vm(|vm| {
+        unsafe {
+            vm.register_native_library("control", rayscript_ffi_fixture::LIBRARY_PATH);
+        }
+        let result = vm.run_source("busy-buffer.rays", r#"
+            native "fixture" { @:blocking function gated_fill(bytes:Bytes, count:SizeT, gate:SizeT):Void; }
+            native "control" { function release_gate(gate:SizeT):Void; }
+            var bytes = Bytes(2);
+            var task = spawn(() -> gated_fill(bytes, 2, 2)); yield();
+            var errors = 0;
+            try { bytes[0]; } catch(e) { errors++; }
+            try { bytes[0] = 90; } catch(e) { errors++; }
+            try { bytes.toString(); } catch(e) { errors++; }
+            gc(); release_gate(2); await task;
+            return [errors, bytes.toString()];
+        "#).unwrap();
+        assert_eq!(vm.display(result), "[3,BB]");
+    });
+}
+
+#[test]
+fn library_calls_stay_on_one_lane_and_sleeping_calls_finish() {
+    with_vm(|vm| {
+        let result = vm
+            .run_source(
+                "lane-affinity.rays",
+                r#"
+            native "fixture" {
+                @:blocking function sleep_value(ms:SizeT, value:Int64):Int64;
+                function native_thread_id():SizeT;
+            }
+            var value = sleep_value(5, 17);
+            var first = native_thread_id();
+            var second = spawn(() -> native_thread_id());
+            return [value, first == await second];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(vm.display(result), "[17,true]");
+    });
+}
+
+#[test]
+fn foreign_thread_same_library_reentry_is_rejected_instead_of_deadlocking() {
+    with_vm(|vm| {
+        let result = vm
+            .run_source(
+                "foreign-reentry.rays",
+                r#"
+            native "fixture" {
+                @:failure(-7) callback Visit(value:Int32, data:Ptr):Int32;
+                @:blocking function callback_worker(cb:Visit):Int32;
+                function add(a:Int64,b:Int64):Int64;
+            }
+            try { callback_worker(Visit((v,d) -> add(1,2))); } catch(e) { return e; }
+            return 'missing error';
+        "#,
+            )
+            .unwrap();
+        assert!(vm.display(result).contains("same-library reentry"));
+    });
+}
+
+#[test]
+fn cancellation_and_vm_drop_drain_native_calls_without_running_new_callbacks() {
+    let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let copy = observed.clone();
+    with_vm(move |vm| {
+        vm.define_native("observe", move |_, _| {
+            copy.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Value::Int(0))
+        });
+        let fiber = vm
+            .start_source(
+                "drop-worker.rays",
+                r#"
+            native "fixture" {
+                @:failure(-7) callback Visit(value:Int32, data:Ptr):Int32;
+                @:blocking function visit(cb:Visit, data:Ptr, count:Int32):Int32;
+            }
+            visit(Visit((v,d) -> observe()), null, 1);
+        "#,
+            )
+            .unwrap();
+        vm.tick(10_000);
+        assert!(vm.has_native_work());
+        vm.cancel(fiber);
+        // Drop drains callbacks as failure returns, without invoking more script.
+    });
+    assert!(!observed.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[test]
+fn worker_owned_outputs_survive_callback_close_and_gc() {
+    with_vm(|vm| {
+        let result = run_handles(
+            vm,
+            r#"
+            native "fixture" {
+                @:failure(-7) callback Visit(value:Int32,data:Ptr):Int32;
+                @:blocking @:owner(session) function visit_record(out:Out<Record>,session:Session,cb:Visit):Void;
+                function freed_globally(id:Int64):Bool;
+            }
+            var owner = session(450); var output = Out(Record); var before = true;
+            visit_record(output, owner, Visit((v,d) -> { owner.close(); gc(); before = freed_globally(450); return 0; }));
+            return [output.value == null, before, freed_globally(45003), freed_globally(450)];
+        "#,
+        );
+        assert_eq!(vm.display(result), "[true,false,true,true]");
+    });
+}
+
+#[test]
+fn pending_calls_retain_their_library_after_registration_replacement() {
+    with_vm(|vm| {
+        unsafe {
+            vm.register_native_library("control", rayscript_ffi_fixture::LIBRARY_PATH);
+        }
+        let fiber = vm
+            .start_source(
+                "replace-worker.rays",
+                r#"
+            native "fixture" { @:blocking function gated_value(gate:SizeT,value:Int64):Int64; }
+            return gated_value(3, 81);
+        "#,
+            )
+            .unwrap();
+        vm.tick(10_000);
+        unsafe {
+            vm.register_native_library("fixture", "/missing/replacement");
+        }
+        vm.collect();
+        vm.run_source(
+            "release-worker.rays",
+            r#"native "control" { function release_gate(gate:SizeT):Void; } release_gate(3);"#,
+        )
+        .unwrap();
+        while vm.has_native_work() {
+            vm.poll_native();
+            vm.run_until_idle(10_000);
+            std::thread::yield_now();
+        }
+        vm.run_until_idle(10_000);
+        assert_eq!(vm.display(vm.fiber_result(fiber).unwrap()), "81");
+    });
+}
+
+#[test]
+fn callback_pointer_results_stay_busy_until_c_finishes_using_them() {
+    with_vm(|vm| {
+        unsafe {
+            vm.register_native_library("control", rayscript_ffi_fixture::LIBRARY_PATH);
+        }
+        let result = vm.run_source("callback-buffer-lock.rays", r#"
+            native "fixture" {
+                @:failure(null) callback Buffer():Ptr;
+                @:blocking function callback_gated_pointer(cb:Buffer,gate:SizeT):UInt8;
+            }
+            native "control" { function release_gate(gate:SizeT):Void; }
+            var buffer = null;
+            var task = spawn(() -> callback_gated_pointer(Buffer(() -> { buffer = Bytes([17]); return buffer; }), 4));
+            while (buffer == null) yield();
+            var blocked = false; try { buffer[0] = 99; } catch(e) { blocked = true; }
+            gc(); release_gate(4);
+            return [blocked, await task, buffer[0]];
+        "#).unwrap();
+        assert_eq!(vm.display(result), "[true,17,17]");
+    });
+}
+
+#[test]
+fn lane_results_are_decoded_before_library_scratch_storage_can_change() {
+    with_vm(|vm| {
+        let result = vm
+            .run_source(
+                "worker-strings.rays",
+                r#"
+            native "fixture" {
+                @:blocking function sleep_value(ms:SizeT,value:Int64):Int64;
+                function scratch_text(value:Int64):CString;
+                @:failure(null) callback Text(value:CString):CString;
+                function callback_strings(cb:Text):CString;
+            }
+            sleep_value(1, 0);
+            var one = spawn(() -> scratch_text(1)); var two = spawn(() -> scratch_text(2));
+            var first = callback_strings(Text(text -> { gc(); return text + '-copy'; }));
+            return [await one, await two, first];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(vm.display(result), "[1,2,first-copy]");
+    });
+}
+
+#[test]
+fn concurrent_foreign_callbacks_are_serialized_while_a_callback_waits() {
+    with_vm(|vm| {
+        unsafe {
+            vm.register_native_library("control", rayscript_ffi_fixture::LIBRARY_PATH);
+        }
+        let result = vm.run_source("parallel-native-callbacks.rays", r#"
+            native "fixture" {
+                @:failure(-7) callback Visit(value:Int32,data:Ptr):Int32;
+                @:blocking function callback_workers(cb:Visit):Int32;
+            }
+            native "control" { @:blocking function sleep_value(ms:SizeT,value:Int64):Int64; }
+            var calls = 0;
+            var result = callback_workers(Visit((v,d) -> { calls++; gc(); return sleep_value(5, v+10); }));
+            return [result, calls];
+        "#).unwrap();
+        assert_eq!(vm.display(result), "[23,2]");
     });
 }

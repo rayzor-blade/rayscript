@@ -65,6 +65,7 @@ pub extern "C" fn stored() -> i64 {
 }
 
 // Thread-local counters keep independent VM tests from sharing fixture state.
+static ALL_FREED: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
 thread_local! {
     static FREED: std::cell::RefCell<Vec<i64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -94,6 +95,7 @@ pub unsafe extern "C" fn close_session(session: *mut Session) {
     if !session.is_null() {
         let session = unsafe { Box::from_raw(session) };
         FREED.with(|f| f.borrow_mut().push(session.id));
+        ALL_FREED.lock().unwrap().push(session.id);
     }
 }
 #[unsafe(no_mangle)]
@@ -114,6 +116,7 @@ pub unsafe extern "C" fn free_record(record: *mut Record) {
         // Reading the parent verifies that a record is destroyed before its session.
         let parent = unsafe { (*record.session).id };
         FREED.with(|f| f.borrow_mut().push(parent * 100 + record.id));
+        ALL_FREED.lock().unwrap().push(parent * 100 + record.id);
     }
 }
 #[unsafe(no_mangle)]
@@ -666,4 +669,66 @@ pub unsafe extern "C" fn run_registered_visit() -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn unregister_visit() {
     REGISTERED_VISIT.with(|slot| slot.set(None));
+}
+
+static GATES: [std::sync::atomic::AtomicBool; 16] =
+    [const { std::sync::atomic::AtomicBool::new(false) }; 16];
+#[unsafe(no_mangle)]
+pub extern "C" fn release_gate(gate: usize) {
+    GATES[gate].store(true, Ordering::Release);
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn gated_value(gate: usize, value: i64) -> i64 {
+    while !GATES[gate].load(Ordering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    value
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gated_fill(bytes: *mut u8, count: usize, gate: usize) {
+    for index in 0..count {
+        unsafe { bytes.add(index).write(66) };
+    }
+    gated_value(gate, 0);
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn sleep_value(ms: usize, value: i64) -> i64 {
+    std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    value
+}
+static NEXT_THREAD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+thread_local! { static NATIVE_THREAD: usize = NEXT_THREAD.fetch_add(1, Ordering::SeqCst); }
+#[unsafe(no_mangle)]
+pub extern "C" fn native_thread_id() -> usize {
+    NATIVE_THREAD.with(|id| *id)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn freed_globally(id: i64) -> bool {
+    ALL_FREED.lock().unwrap().contains(&id)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn callback_gated_pointer(
+    callback: unsafe extern "C" fn() -> *const u8,
+    gate: usize,
+) -> u8 {
+    let pointer = unsafe { callback() };
+    gated_value(gate, 0);
+    unsafe { *pointer }
+}
+thread_local! { static SCRATCH_TEXT: std::cell::RefCell<std::ffi::CString> = std::cell::RefCell::new(std::ffi::CString::new("").unwrap()); }
+#[unsafe(no_mangle)]
+pub extern "C" fn scratch_text(value: i64) -> *const c_char {
+    SCRATCH_TEXT.with(|text| {
+        *text.borrow_mut() = std::ffi::CString::new(value.to_string()).unwrap();
+        text.borrow().as_ptr()
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn callback_workers(callback: Visit) -> i32 {
+    let a = std::thread::spawn(move || unsafe { callback(1, std::ptr::null_mut()) });
+    let b = std::thread::spawn(move || unsafe { callback(2, std::ptr::null_mut()) });
+    a.join().unwrap() + b.join().unwrap()
 }

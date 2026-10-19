@@ -183,6 +183,7 @@ struct Gate {
     failure: Slot,
     rejected: AtomicBool,
     body: *const Body,
+    bridge: std::sync::Mutex<Option<std::sync::Arc<lane::Hub>>>,
 }
 
 pub(super) struct Callback {
@@ -221,6 +222,7 @@ impl Callback {
             failure: ty.failure,
             rejected: AtomicBool::new(false),
             body: &*body,
+            bridge: std::sync::Mutex::new(vm.foreign.workers.hub(&ty.loaded)),
         });
         let (closure, code) =
             libffi::low::try_closure_alloc().ok_or("cannot allocate native callback")?;
@@ -260,10 +262,12 @@ pub(super) fn pointer(value: Value, ty: &Rc<CallbackType>) -> Result<*mut c_void
 }
 
 pub(super) struct Frame {
-    roots: Vec<Value>,
+    pub(super) roots: Vec<Value>,
+    pub(super) exposed: Vec<Value>,
     pinned_strings: Vec<Rc<CString>>,
+    backings: Vec<Rc<structure::Backing>>,
     return_strings: Vec<CString>,
-    error: Option<Value>,
+    pub(super) error: Option<Value>,
     pub(super) outputs: Vec<Value>,
 }
 
@@ -271,7 +275,9 @@ impl Frame {
     pub(super) fn new(args: &[Value], types: &[NativeType]) -> Self {
         let mut frame = Self {
             roots: Vec::new(),
+            exposed: Vec::new(),
             pinned_strings: Vec::new(),
+            backings: Vec::new(),
             return_strings: Vec::new(),
             error: None,
             outputs: args
@@ -284,7 +290,7 @@ impl Frame {
         frame
     }
 
-    fn retain(&mut self, values: &[Value]) {
+    pub(super) fn retain(&mut self, values: &[Value]) {
         let mut roots: Vec<_> = values
             .iter()
             .copied()
@@ -307,19 +313,16 @@ impl Frame {
                 }
             }
         }
+        self.exposed.extend(roots.iter().copied());
         self.roots.extend(roots);
     }
 }
 
 impl Libraries {
     pub(crate) fn trace(&self, f: &mut dyn FnMut(Value)) {
+        self.workers.trace(f);
         for frame in &self.frames {
-            for v in &frame.roots {
-                f(*v);
-            }
-            if let Some(error) = frame.error {
-                f(error);
-            }
+            frame.trace(f);
         }
     }
 }
@@ -379,6 +382,12 @@ unsafe extern "C" fn trampoline(
     let gate = unsafe { &*data.cast::<Gate>() };
     unsafe { write_result(result, gate.ret, gate.failure) };
     if std::thread::current().id() != gate.thread {
+        let bridge = gate.bridge.lock().unwrap().clone();
+        if let Some(bridge) = bridge {
+            if bridge.callback(data as usize, args as usize, result as usize) {
+                return;
+            }
+        }
         gate.rejected.store(true, Ordering::Relaxed);
         return;
     }
@@ -387,7 +396,15 @@ unsafe extern "C" fn trampoline(
         gate.rejected.store(true, Ordering::Relaxed);
         return;
     }
-    let vm = unsafe { &mut *vm };
+    unsafe {
+        dispatch(&mut *vm, data as usize, args as usize, result as usize);
+    }
+}
+
+pub(super) unsafe fn dispatch(vm: &mut Vm, gate: usize, args: usize, result: usize) {
+    let gate = unsafe { &*(gate as *const Gate) };
+    let args = args as *mut *mut c_void;
+    let result = result as *mut c_void;
     if vm.foreign.frames.last().is_none_or(|f| f.error.is_some()) {
         return;
     }
@@ -482,7 +499,14 @@ impl Body {
             args.push(value);
             vm.foreign.frames.last_mut().unwrap().retain(&[value]);
         }
-        let value = vm.call(self.callable, &args)?;
+        let result = vm.call(self.callable, &args);
+        vm.foreign
+            .frames
+            .last_mut()
+            .unwrap()
+            .retain(&[self.value.get(), self.callable]);
+        vm.foreign.frames.last_mut().unwrap().retain(&args);
+        let value = result?;
         vm.foreign.frames.last_mut().unwrap().retain(&[value]);
         match &self.ty.ret {
             NativeType::Scalar(Scalar::Void) => Ok(Slot { u64_: 0 }),
@@ -509,3 +533,56 @@ impl Body {
     }
 }
 type NativeResultSlot = Result<Slot, Value>;
+
+pub(super) fn attach(vm: &Vm, library: &Rc<Library>, bridge: std::sync::Arc<lane::Hub>) {
+    for callback in vm
+        .foreign
+        .callback_instances
+        .iter()
+        .filter_map(Weak::upgrade)
+    {
+        if Rc::ptr_eq(&callback.body.ty.loaded, library) {
+            *callback.gate.bridge.lock().unwrap() = Some(bridge.clone());
+        }
+    }
+}
+
+impl Frame {
+    pub(super) fn trace(&self, f: &mut dyn FnMut(Value)) {
+        for value in &self.roots {
+            f(*value);
+        }
+        for backing in &self.backings {
+            backing.trace(f);
+        }
+        if let Some(error) = self.error {
+            f(error);
+        }
+    }
+    pub(super) fn pin_all(&mut self, vm: &Vm) {
+        let exposed = self.exposed.len();
+        for callback in vm
+            .foreign
+            .callback_instances
+            .iter()
+            .filter_map(Weak::upgrade)
+        {
+            self.retain(&[callback.body.value.get()]);
+        }
+        for backing in vm.foreign.struct_backings.iter().filter_map(Weak::upgrade) {
+            let mut values = Vec::new();
+            backing.trace(&mut |v| values.push(v));
+            self.retain(&values);
+            backing.pin_strings(&mut self.pinned_strings);
+            self.backings.push(backing);
+        }
+        self.exposed.truncate(exposed);
+    }
+}
+
+pub(super) unsafe fn failure(gate: usize, result: usize) {
+    let gate = unsafe { &*(gate as *const Gate) };
+    unsafe {
+        write_result(result as *mut c_void, gate.ret, gate.failure);
+    }
+}

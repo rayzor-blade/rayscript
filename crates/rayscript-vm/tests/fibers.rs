@@ -153,3 +153,16 @@ fn a_fiber_that_runs_out_of_fuel_resumes_exactly_where_it_stopped() {
         assert_eq!(got, want, "with {fuel} polls to a turn");
     }
 }
+
+#[test]
+fn script_fibers_execute_on_distinct_stable_krio_stacks() {
+    let mut vm = Vm::new();
+    vm.define_native("krio_id", |_, _| Ok(rayscript_vm::Value::Int(krio_fiber::current_fiber_id().expect("script runs on a Krio stack") as i64)));
+    let result = vm.run_source("krio.rays", r#"
+        var parent = krio_id();
+        var child = spawn(() -> { var first = krio_id(); yield(); return [first, krio_id()]; });
+        yield(); var ids = await child;
+        return [parent == krio_id(), parent != ids[0], ids[0] == ids[1]];
+    "#).unwrap();
+    assert_eq!(vm.display(result), "[true,true,true]");
+}

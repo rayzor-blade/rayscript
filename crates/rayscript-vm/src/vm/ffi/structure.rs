@@ -278,6 +278,7 @@ struct Retained {
 }
 
 pub(crate) struct Backing {
+    pub(super) busy: Cell<Option<u64>>,
     allocation: Option<Allocation>,
     expired: Option<Rc<Cell<bool>>>,
     owner: Option<Value>,
@@ -294,6 +295,7 @@ impl Backing {
         guard: Option<Rc<Resource>>,
     ) -> Rc<Self> {
         Rc::new(Self {
+            busy: Cell::new(None),
             allocation,
             expired: None,
             owner,
@@ -316,6 +318,7 @@ impl Backing {
         self.owner.is_some_and(|v| storage_closed_value(v, seen))
     }
     fn check_storage(&self) -> Result<(), String> {
+        worker::check(self.busy.get())?;
         if self.storage_closed(&mut HashSet::new()) {
             Err("struct storage is closed".into())
         } else {
@@ -323,6 +326,7 @@ impl Backing {
         }
     }
     pub(super) fn check(&self) -> Result<(), String> {
+        worker::check(self.busy.get())?;
         if self.closed(&mut HashSet::new()) {
             Err("struct storage or a referenced native handle is closed".into())
         } else {
@@ -354,6 +358,9 @@ impl Backing {
             let current = unsafe { (*address as *const *mut c_void).read_unaligned() };
             current == retained.ptr && closed_value(retained.value, seen)
         })
+    }
+    pub(super) fn pin_strings(&self, strings: &mut Vec<Rc<CString>>) {
+        strings.extend(self.strings.borrow().values().cloned());
     }
     pub(super) fn trace(&self, f: &mut dyn FnMut(Value)) {
         if let Some(owner) = self.owner {
@@ -899,6 +906,7 @@ pub(super) fn handle_pointer(value: Value, ty: &Rc<HandleType>) -> Result<*mut c
     }
     match foreign(value) {
         Some(Foreign::Handle(r)) if Rc::ptr_eq(&r.ty, ty) => {
+            worker::check(r.busy.get())?;
             if r.ptr.get().is_null() {
                 Err("handle is closed".into())
             } else {
@@ -1317,6 +1325,7 @@ pub(super) fn callback_argument(
             .map(|r| vm.new_host(0, Box::new(Foreign::Handle(r.clone()))))
     });
     let backing = Rc::new(Backing {
+        busy: Cell::new(None),
         allocation: None,
         expired: Some(expired),
         owner: keeper,
@@ -1382,4 +1391,30 @@ pub(super) fn pin_cstring(vm: &Vm, ptr: *const c_char, strings: &mut Vec<Rc<CStr
             }
         }
     }
+}
+
+pub(super) fn lock(value: Value, id: u64, locks: &mut Vec<worker::Lock>) -> Result<(), String> {
+    let backing = match foreign(value) {
+        Some(Foreign::Struct(view)) => Some(view.backing.clone()),
+        Some(
+            Foreign::Pointer {
+                structure: Some(backing),
+                ..
+            }
+            | Foreign::BorrowedHandle { backing, .. },
+        ) => Some(backing.clone()),
+        _ => value
+            .as_obj()
+            .filter(|o| o.kind() == Kind::Bytes)
+            .and_then(|o| o.bytes().native_backing.borrow().clone()),
+    };
+    if let Some(backing) = backing {
+        let old = backing.busy.get();
+        if old != Some(id) {
+            worker::check(old)?;
+            backing.busy.set(Some(id));
+            locks.push(worker::Lock::Backing(backing, old));
+        }
+    }
+    Ok(())
 }

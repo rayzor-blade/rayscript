@@ -10,6 +10,7 @@ rayscript-gc.workspace = true
 rayscript-syntax.workspace = true
 libloading = "0.9"
 libffi = "5.2"
+krio-fiber = { git = "https://github.com/darmie/krio.git", rev = "d41b01107b9be561b72826c9b398de06e3b413c4" }
 
 [dev-dependencies]
 rayscript-ffi-fixture = { path = "../rayscript-ffi-fixture" }

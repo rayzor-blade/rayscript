@@ -161,6 +161,13 @@ impl Vm {
                 save_pc!();
                 match func(self, args) {
                     Ok(v) => {
+                        if let Some(promise) = self.native_pending.take() {
+                            promise.as_obj().unwrap().promise().waiters.push(fo);
+                            f!().await_dst = (dst - base) as crate::bytecode::Reg;
+                            f!().native_wait = true;
+                            f!().stack[dst] = promise;
+                            return Exit::Wait;
+                        }
                         f!().stack[dst] = v;
                     }
                     Err(e) => throw!(e),

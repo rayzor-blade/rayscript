@@ -1,4 +1,4 @@
-//! A fiber: one thread of script execution, held as data. Its stack of registers, its call frames and its
+//! A script fiber driven by a thread-affine Krio stack. Its registers, bytecode call frames and its
 //! `try` handlers are all here, so the VM can stop it at any poll, run another, and come back, with
 //! nothing of it on the Rust stack.
 
@@ -60,6 +60,8 @@ pub struct Failure {
 }
 
 pub struct Fiber {
+    // Yield/resume slots keep a stable address across scheduler turns.
+    pub(crate) driver: Option<Box<krio_fiber::Fiber>>,
     pub stack: Vec<Value>,
     /// Registers below this are live; the collector traces only those.
     pub top: usize,
@@ -67,8 +69,9 @@ pub struct Fiber {
     pub handlers: Vec<Handler>,
     pub state: FiberState,
     pub wake: Wake,
-    /// The register of the `await` the fiber is parked on, in its top frame.
+    /// The result register of the await or native call the fiber is parked on.
     pub await_dst: Reg,
+    pub(crate) native_wait: bool,
     pub result: Value,
     pub failure: Option<Failure>,
     /// The value that was thrown, when the fiber failed; a fiber that awaits this one throws it again.
@@ -84,6 +87,7 @@ pub struct Fiber {
 impl Fiber {
     pub fn new(id: u64) -> Fiber {
         Fiber {
+            driver: None,
             stack: Vec::new(),
             top: 0,
             frames: Vec::new(),
@@ -91,6 +95,7 @@ impl Fiber {
             state: FiberState::Ready,
             wake: Wake::None,
             await_dst: 0,
+            native_wait: false,
             result: Value::Nil,
             failure: None,
             error: Value::Nil,
@@ -122,6 +127,17 @@ impl Fiber {
         }
         for w in &self.waiters {
             f(Value::Obj(*w));
+        }
+    }
+}
+
+impl Drop for Fiber {
+    fn drop(&mut self) {
+        if let Some(mut driver) = self.driver.take() {
+            if driver.state() == krio_fiber::FiberState::Suspended {
+                // A zero turn ends the driver without accessing the VM during a sweep or teardown.
+                driver.resume_with_u64(0);
+            }
         }
     }
 }

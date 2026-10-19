@@ -229,6 +229,7 @@ impl Vm {
             }
             match (o.kind(), index) {
                 (Kind::Bytes, Value::Int(i)) => {
+                    super::ffi::check_bytes(Value::Obj(o)).map_err(|e| self.err(e))?;
                     return Ok(usize::try_from(i).ok().and_then(|i| o.bytes().slice().get(i)).map(|n| Value::Int(*n as i64)).unwrap_or(Value::Nil));
                 }
                 (Kind::Array, Value::Int(i)) => {
@@ -259,6 +260,7 @@ impl Vm {
             }
             match (o.kind(), index) {
                 (Kind::Bytes, Value::Int(i)) => {
+                    super::ffi::check_bytes(Value::Obj(o)).map_err(|e| self.err(e))?;
                     let Some(index) = usize::try_from(i).ok().filter(|i| *i < o.bytes().len()) else { return Err(self.err("Bytes index out of range")); };
                     let Value::Int(n) = v else { return Err(self.err("Bytes element needs an Int in 0..255")); };
                     let byte = u8::try_from(n).map_err(|_| self.err("Bytes element needs an Int in 0..255"))?;

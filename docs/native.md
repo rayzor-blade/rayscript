@@ -159,11 +159,36 @@ Callback arguments support scalars, `CString`, `Ptr`, declared structs (includin
 
 Non-void callbacks require one `@:failure(literal)` annotation, checked against the result type. Signed integer and floating-point literals and booleans are accepted; pointer and `CString` results require null. Void callbacks may omit the annotation or use `@:failure(null)`. If the callback throws or its result cannot be converted, C receives this failure value. Remaining callbacks in that C call also return the failure value without invoking script. After C returns and output slots have been decoded, the original thrown value is rethrown. Nested native calls have their own error scope, so script may catch an inner call's error and continue the outer callback.
 
-Callbacks can call native functions recursively, including the binding that invoked them. Active output slots cannot be reused by nested calls. A callback runs synchronously on its creating VM thread and cannot suspend. Calls from other threads return the failure value without entering the VM and cause an error when the active C call returns. Worker-thread marshaling is not implemented yet.
+Callbacks can call native functions recursively, including the binding that invoked them. Active output slots cannot be reused by nested calls. A callback always runs on its creating VM thread. Worker callbacks are marshaled to that thread and wait for their result. Callbacks can wait for nested native calls, but cannot suspend on host promises or arbitrary script awaits. Calls from another thread without an active worker call return the failure value and are unsupported.
 
 Active calls retain their argument graph, callback arguments and pointer results, including replaced struct strings and callback fields, through the return from C. A callback may run GC or close an owned handle: closure storage and passed buffers remain allocated, and actual handle frees wait until the outermost call returns. Closed handles become invalid to script immediately. Callback string results remain NUL-terminated and valid until the enclosing C call returns.
 
 If C retains a callback or VM pointer beyond the call, the script must keep the callback and its data reachable for the entire registration, and unregister it before releasing them. Native code must stop invoking a callback before its VM is destroyed. Calls outside an active native call are unsupported. A stored function pointer does not itself root script values.
+
+## Blocking calls and Krio fibers
+
+```haxe
+native "fixture" {
+  @:blocking function sleep_value(ms:SizeT, value:Int64):Int64;
+}
+var task = spawn(() -> sleep_value(50, 42));
+// Other script fibers can run while C is blocked.
+trace(await task);
+```
+
+`@:blocking` implicitly parks the calling script fiber and resumes it with the C result or deferred callback exception. It does not require an explicit `await` at the native call. `Vm.call` and `Vm.run_source` drive the required native events synchronously for embedding callers; the scheduler's ordinary `tick` and `run_until_idle` poll events without waiting for outstanding calls. Callback dispatch is synchronous and can drive nested native calls. Errors returned as C status codes remain the script's responsibility.
+
+Script interpreter turns execute on thread-affine Krio fibers on the VM thread. Their register stacks and bytecode frames remain explicit for GC, exception handling and debugging. Each fiber creates a guarded 1 MiB Krio stack when first run and releases it when finished or cancelled. No VM borrow survives a yield between interpreter turns. Native-to-script nesting is bounded independently of physical stack addresses.
+
+Each registered library instance creates one OS worker thread on its first blocking call. That thread hosts Krio fibers for C calls. After the lane exists, ordinary calls into the same instance also use it to preserve serialization and thread-local library state. Unrelated calls are queued. A callback on the lane parks its native Krio fiber while the VM handles it, allowing explicit same-library reentry on that same OS thread. The stacks remain on their creating threads; no Krio fiber migrates between threads.
+
+A callback from a thread created by C is also marshaled to the VM, and that C thread waits for the reply. Reentering the same library from such a callback is rejected: its lane thread may be blocked inside C waiting for that thread. Calls into other library instances are supported. Native destructors still run on the VM thread after all active native calls have returned; the library's ownership contract must permit that.
+
+Pending calls retain their arguments, callbacks and native storage through completion. Reads, writes and reuse of worker-visible buffers, structs and handles from other script fibers raise a busy-storage error. The active callback may access its call's storage while C is paused. Buffers and dependencies exposed by a callback remain protected until C finishes. Active output slots cannot be reused. C-retained registrations still require roots and correct synchronization: scripts must not mutate registered data while C uses it outside a callback.
+
+Cancelling a script fiber does not terminate arbitrary C code. Its pending call keeps its storage and library alive until C returns, and owned outputs are still captured for cleanup. VM teardown drains in-flight calls, replies to further callbacks with their failure values without running script, then stops the lanes before dropping heap objects or unloading libraries. A native call that never returns requires the embedding application to terminate its process.
+
+Embedders can call `Vm.set_native_waker` with a thread-safe wake function, then call `Vm.poll_native` on the VM thread when woken. `Vm.has_native_work` reports calls still in flight. The extension host uses this mechanism to wake its protocol loop for callbacks and completions independently of stdin or timers. `serve_host` accepts an embedder-configured `Host`; the standard host still registers no native libraries by default.
 
 ## Checking
 
@@ -177,4 +202,4 @@ The `rayscript-ffi-fixture` workspace crate builds a Rust C-ABI shared library b
 
 ## Limits
 
-Worker lanes are not implemented. Function annotations other than `@:owner`, including `@:blocking`, are rejected rather than silently ignored. The initial target is macOS arm64; other targets require their own ABI tests. Structs by value, unions and variadic calls are outside v1.
+Native manifest trust and hash checks remain unimplemented. Function annotations other than `@:owner` and `@:blocking` are rejected. The initial target is macOS arm64; other targets require their own ABI tests. Structs by value, unions and variadic calls are outside v1.

@@ -108,7 +108,7 @@ fn main() {
 }
 ```
 
-`cargo run -p rayscript-vm --example embed` prints `42`. Run a VM on a thread with a stack of 16 MiB or more: nested calls from natives are limited by stack used.
+`cargo run -p rayscript-vm --example embed` prints `42`. Script fibers execute on guarded Krio stacks. Run the VM on a thread with at least 16 MiB for host-side callback dispatch; nested native-to-script calls have a fixed depth bound. Blocking native calls use Krio fibers on one OS thread per registered library instance.
 
 ## Crates
 
@@ -123,7 +123,7 @@ fn main() {
 
 ## Status
 
-- [Native calls](docs/native.md) bind C functions from explicitly registered libraries, with scalars, strings, pointers, output slots, owned handles, byte buffers, C-aligned structs, struct arrays and callbacks on the VM thread. Worker lanes are not implemented yet.
+- [Native calls](docs/native.md) bind C functions from explicitly registered libraries, with scalars, strings, pointers, output slots, owned handles, byte buffers, C-aligned structs, struct arrays, callbacks on the VM thread and blocking calls on Krio worker lanes. Native manifest trust remains unimplemented.
 - No release yet; build from source with `cargo build --release`. `cargo test` runs the suite.
 
 MIT OR Apache-2.0.

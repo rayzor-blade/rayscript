@@ -1,7 +1,9 @@
 //! C calls with typed output slots and traced native ownership. Library names are resolved only through the embedder's explicit registrations.
 
 mod callback;
+mod lane;
 pub(crate) mod structure;
+mod worker;
 
 use super::{NativeResult, Vm};
 use crate::{Value, object::Kind};
@@ -17,6 +19,7 @@ use std::{
 
 #[derive(Default)]
 pub(crate) struct Libraries {
+    workers: worker::Workers,
     paths: HashMap<String, PathBuf>,
     loaded: HashMap<String, Rc<Library>>,
     types: HashMap<(String, String), Rc<HandleType>>,
@@ -204,6 +207,7 @@ struct HandleType {
 }
 
 struct Resource {
+    busy: Cell<Option<u64>>,
     ptr: Cell<*mut c_void>,
     ty: Rc<HandleType>,
     parent: Option<Rc<Resource>>,
@@ -483,6 +487,7 @@ pub(crate) fn install(vm: &mut Vm) {
         if args.len() != 1 {
             return Err(vm.err("Bytes.toString takes no arguments"));
         }
+        check_bytes(args[0]).map_err(|e| vm.err(e))?;
         let data = args[0].as_obj().unwrap().bytes().slice();
         let text = std::str::from_utf8(data).map_err(|_| vm.err("Bytes is not UTF-8"))?;
         Ok(vm.new_string(text))
@@ -491,13 +496,14 @@ pub(crate) fn install(vm: &mut Vm) {
         if args.len() != 1 {
             return Err(vm.err("Bytes.copy takes no arguments"));
         }
+        check_bytes(args[0]).map_err(|e| vm.err(e))?;
         Ok(vm.new_bytes(args[0].as_obj().unwrap().bytes().slice().to_vec()))
     });
 }
 
 impl Libraries {
     pub(crate) fn drain(&mut self) {
-        if !self.frames.is_empty() {
+        if !self.frames.is_empty() || self.workers.busy() {
             return;
         }
         // Drop each entry outside the queue borrow: releasing its owner may enqueue another free.
@@ -533,6 +539,7 @@ struct Bound {
     name: String,
     owner: Option<usize>,
     destructor: bool,
+    blocking: bool,
     scratch: RefCell<Arguments>,
 }
 
@@ -672,19 +679,24 @@ impl Vm {
             };
             return Ok(self.new_host(0, Box::new(Foreign::Type(NativeType::Handle(ty)))));
         }
-        let owner = if flags.is_empty() {
-            None
-        } else if let Some(index) = flags.strip_prefix("owner=") {
-            Some(
-                index
-                    .parse::<usize>()
-                    .map_err(|_| "invalid owner annotation")?,
-            )
-        } else {
-            return Err(format!(
-                "native annotations `{flags}` are not available yet"
-            ));
-        };
+        let mut owner = None;
+        let mut blocking = false;
+        for flag in flags.split(',').filter(|s| !s.is_empty()) {
+            if flag == "blocking" && !blocking {
+                blocking = true;
+            } else if let Some(index) = flag.strip_prefix("owner=") {
+                if owner.is_some() {
+                    return Err("duplicate owner annotation".into());
+                }
+                owner = Some(
+                    index
+                        .parse::<usize>()
+                        .map_err(|_| "invalid owner annotation")?,
+                );
+            } else {
+                return Err(format!("native annotation `{flag}` is not available"));
+            }
+        }
         let (args, ret) = signature
             .split_once("->")
             .ok_or("invalid native signature")?;
@@ -727,7 +739,10 @@ impl Vm {
             *unsafe { loaded.get::<unsafe extern "C" fn()>(symbol.as_bytes()) }
                 .map_err(|e| format!("symbol not found: {e}"))?,
         );
-        let bound = Bound {
+        if destructor && blocking {
+            return Err("native destructors cannot be marked blocking".into());
+        }
+        let bound = Rc::new(Bound {
             code,
             scratch: RefCell::new(Arguments::new(args.len())),
             library: loaded,
@@ -737,13 +752,17 @@ impl Vm {
             name: name.into(),
             owner,
             destructor,
-        };
+            blocking,
+        });
         Ok(self.native(name, move |vm, args| bound.call(vm, args)))
     }
 }
 
 impl Bound {
-    fn call(&self, vm: &mut Vm, args: &[Value]) -> NativeResult {
+    fn call(self: &Rc<Self>, vm: &mut Vm, args: &[Value]) -> NativeResult {
+        if !self.destructor && (self.blocking || vm.foreign.workers.has_lane(&self.library)) {
+            return worker::submit(vm, self.clone(), args);
+        }
         let framed = !vm.foreign.callbacks.is_empty()
             || !vm.foreign.callback_instances.is_empty()
             || !vm.foreign.frames.is_empty();
@@ -884,14 +903,18 @@ impl Bound {
         let ptr = match ty {
             NativeType::Scalar(s) => return encode(*s, value, scratch, index),
             NativeType::Ptr => pointer(value)?,
-            NativeType::Bytes => match value {
-                Value::Obj(o) if o.kind() == Kind::Bytes => o.bytes().as_mut_ptr().cast(),
-                _ => return Err("expected Bytes".into()),
-            },
+            NativeType::Bytes => {
+                check_bytes(value)?;
+                match value {
+                    Value::Obj(o) if o.kind() == Kind::Bytes => o.bytes().as_mut_ptr().cast(),
+                    _ => return Err("expected Bytes".into()),
+                }
+            }
             NativeType::Struct(ty) => structure::struct_pointer(value, ty)?,
             NativeType::Callback(ty) => callback::pointer(value, ty)?,
             NativeType::Handle(ty) => match foreign(value) {
                 Some(Foreign::Handle(r)) if Rc::ptr_eq(ty, &r.ty) => {
+                    worker::check(r.busy.get())?;
                     if r.ptr.get().is_null() {
                         return Err("handle is closed".into());
                     }
@@ -985,6 +1008,7 @@ impl Bound {
                 } else {
                     let resource = Rc::new(Resource {
                         ptr: Cell::new(ptr),
+                        busy: Cell::new(None),
                         ty: ty.clone(),
                         parent: owner.map(|(_, r)| r.clone()),
                         children: RefCell::new(Vec::new()),
@@ -1029,14 +1053,20 @@ fn pointer(value: Value) -> Result<*mut c_void, String> {
             }
             Ok(*ptr)
         }
-        Some(Foreign::Handle(r)) => Ok(r.ptr.get()),
+        Some(Foreign::Handle(r)) => {
+            worker::check(r.busy.get())?;
+            Ok(r.ptr.get())
+        }
         Some(Foreign::BorrowedHandle { ptr, backing, .. }) => {
             backing.check()?;
             Ok(*ptr)
         }
         Some(Foreign::Struct(view)) => view.address(),
         _ => match value {
-            Value::Obj(o) if o.kind() == Kind::Bytes => Ok(o.bytes().as_mut_ptr().cast()),
+            Value::Obj(o) if o.kind() == Kind::Bytes => {
+                check_bytes(value)?;
+                Ok(o.bytes().as_mut_ptr().cast())
+            }
             _ => Err("expected Ptr, handle, Bytes or null".into()),
         },
     }
@@ -1182,4 +1212,13 @@ unsafe fn decode(ty: Scalar, result: Slot, vm: &mut Vm, widened: bool) -> Result
             }
         }
     })
+}
+
+pub(crate) fn check_bytes(value: Value) -> Result<(), String> {
+    if let Some(obj) = value.as_obj().filter(|o| o.kind() == Kind::Bytes) {
+        if let Some(backing) = obj.bytes().native_backing.borrow().as_ref() {
+            worker::check(backing.busy.get())?;
+        }
+    }
+    Ok(())
 }

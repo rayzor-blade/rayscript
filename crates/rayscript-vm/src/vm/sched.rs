@@ -8,16 +8,32 @@ use crate::object::{Kind, Settled};
 use crate::value::{Obj, Value};
 use std::time::Instant;
 
-/// How much of the Rust stack calls from a built-in back into script may use between them, from the
-/// outermost of them: each level is several frames of the interpreter. The thread that runs a VM needs
-/// at least this much to spare and some more for what is below the outermost: run a VM on a thread with
-/// a stack of 16 MiB or more.
-const MAX_NESTED_STACK: usize = 4 * 1024 * 1024;
+// Native-to-script calls use separate Krio stacks; bound their count instead of comparing addresses.
+const MAX_NESTED_CALLS: u32 = 64;
+const SCRIPT_STACK_SIZE: usize = 1024 * 1024;
 
-/// Where the stack is now, near enough to measure how far it has grown.
-fn stack_mark() -> usize {
-    let probe = 0u8;
-    std::hint::black_box(&probe) as *const u8 as usize
+struct Turn {
+    vm: *mut Vm,
+    fiber: Obj,
+    budget: *mut Budget,
+    exit: Option<Exit>,
+}
+
+fn script_driver() -> Box<krio_fiber::Fiber> {
+    Box::new(krio_fiber::Fiber::with_stack_size(SCRIPT_STACK_SIZE, || {
+        let mut input = krio_fiber::take_input_u64();
+        while let Some(address) = input {
+            if address == 0 { return; }
+            // A turn's pointers live only for resume(), and no VM borrow survives the yield.
+            let finished = unsafe {
+                let turn = &mut *(address as *mut Turn);
+                turn.exit = Some((&mut *turn.vm).exec(turn.fiber, &mut *turn.budget));
+                matches!(turn.exit, Some(Exit::Done(_) | Exit::Failed(_, _) | Exit::Cancelled))
+            };
+            if finished { return; }
+            input = krio_fiber::yield_u64(0);
+        }
+    }))
 }
 
 /// How long a fiber may run before it must give way: a number of polls (loop edges and calls), and
@@ -76,8 +92,20 @@ impl Vm {
         }
         o.fiber().fiber.state = FiberState::Running;
         let before = self.current.replace(o);
-        let exit = self.exec(o, budget);
+        let mut driver = o.fiber().fiber.driver.take().unwrap_or_else(script_driver);
+        let mut turn = Turn { vm: self, fiber: o, budget, exit: None };
+        let step = driver.resume_with_u64((&mut turn as *mut Turn) as u64);
         self.current = before;
+        if step == krio_fiber::FiberStep::Errored {
+            let _ = driver.take_error();
+            let error = self.err("panic in script fiber");
+            self.finish(o, FiberState::Failed, Value::Nil, Some(Failure { message: "panic in script fiber".into(), trace: Vec::new() }), error);
+            return Slice::Failed;
+        }
+        let exit = turn.exit.expect("Krio script fiber did not return its turn");
+        if matches!(exit, Exit::Yield | Exit::Wait | Exit::Paused(_)) {
+            o.fiber().fiber.driver = Some(driver);
+        }
         match exit {
             Exit::Yield => {
                 o.fiber().fiber.state = FiberState::Ready;
@@ -145,6 +173,7 @@ impl Vm {
     pub(crate) fn wake(&mut self, w: Obj, wake: Wake) {
         let f = &mut w.fiber().fiber;
         if f.state == FiberState::Waiting {
+            f.native_wait = false;
             f.wake = wake;
             f.state = FiberState::Ready;
             self.ready.push_back(w);
@@ -154,6 +183,7 @@ impl Vm {
     /// Runs each fiber that is ready once, for at most `fuel` polls; returns how many ran. Those that
     /// yield go to the back of the queue.
     pub fn tick(&mut self, fuel: u64) -> usize {
+        self.poll_native();
         if self.debug.paused.is_some() {
             return 0;
         }
@@ -229,19 +259,17 @@ impl Vm {
         self.settle(id, Settled::Rejected(v))
     }
 
-    /// Calls `callee` and runs it to its end, for a native that takes a function: the call may not wait
-    /// for anything. An error is the value thrown.
+    /// Calls `callee` to completion, driving native lane events when needed. Script callbacks may not
+    /// wait on host promises. An error is the value thrown.
     pub fn call(&mut self, callee: Value, args: &[Value]) -> Result<Value, Value> {
         match callee {
             Value::Native(id) => {
                 let f = self.natives[id as usize].f.clone();
-                f(self, args)
+                let result = f(self, args);
+                if let Some(promise) = self.native_pending.take() { self.finish_native(promise) } else { result }
             }
             Value::Obj(c) if c.kind() == Kind::Closure => {
-                let here = stack_mark();
-                if self.nested == 0 {
-                    self.nested_base = here;
-                } else if here.abs_diff(self.nested_base) > MAX_NESTED_STACK {
+                if self.nested >= MAX_NESTED_CALLS {
                     return Err(self.new_string("calls from built-in functions are nested too deeply"));
                 }
                 let fiber = self.spawn(callee, args)?;
@@ -262,6 +290,7 @@ impl Vm {
                         Slice::Done => break Ok(o.fiber().fiber.result),
                         Slice::Failed => break Err(o.fiber().fiber.error),
                         Slice::Cancelled => break Err(self.new_string("cancelled")),
+                        Slice::Waiting if o.fiber().fiber.native_wait => { self.wait_native(); }
                         Slice::Waiting => {
                             self.cancel(fiber);
                             break Err(self.new_string("a function called from a built-in cannot wait for anything"));
@@ -269,6 +298,9 @@ impl Vm {
                     }
                 };
                 self.nested -= 1;
+                if matches!(o.fiber().fiber.state, FiberState::Done | FiberState::Failed | FiberState::Cancelled) {
+                    self.ready.retain(|fiber| *fiber != o);
+                }
                 result
             }
             other => {
