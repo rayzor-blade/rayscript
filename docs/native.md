@@ -215,6 +215,8 @@ cargo test --release -p rayscript-vm --test native scalar_call_overhead -- --ign
 
 The `rayscript-ffi-fixture` workspace crate builds a Rust C-ABI shared library before the VM's native-call tests. It covers integer widths, booleans, floating-point values, mixed signatures, strings, nulls, void results, typed outputs, buffers, owned handles, C layouts, nested structs, arrays, borrowed views and callbacks. Tests also cover registration and symbol failures, argument errors, library lifetime, owner tracing, child-before-parent frees, use after close, aliases and allocations during repeated scalar calls. The ignored release benchmark compares a scalar call with a Rust closure native; measurements belong in the tracker.
 
+RayDE's `scripts/check-git.sh` exercises its `extensions/git/ext/gitNative.rays` consumer against checksum-pinned libgit2 v1.9.7 with system OpenSSH. It checks repository discovery, status, all four diff callbacks, ownership, callback exceptions, GC and concurrent script fibers through the real host grant protocol. Its optional `--benchmark` measures warm status separately from the scalar ABI benchmark.
+
 ## Limits
 
-Native manifest trust and hash checks remain unimplemented. Function annotations other than `@:owner` and `@:blocking` are rejected. The initial target is macOS arm64; other targets require their own ABI tests. Structs by value, unions and variadic calls are outside v1.
+The host accepts editor-approved native manifests and verifies paths, capabilities and SHA-256 before script execution. Function annotations other than `@:owner` and `@:blocking` are rejected. The initial target is macOS arm64; other targets require their own ABI tests. Structs by value, unions and variadic calls are outside v1.
