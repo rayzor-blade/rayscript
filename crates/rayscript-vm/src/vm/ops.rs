@@ -28,6 +28,7 @@ pub fn kind_tag(v: Value) -> u8 {
 }
 
 pub fn equal(a: Value, b: Value) -> bool {
+    if a.is_nil() || b.is_nil() { return a.is_nil() && b.is_nil(); }
     match (a, b) {
         (Value::Nil, Value::Nil) => true,
         (Value::Bool(x), Value::Bool(y)) => x == y,
@@ -76,7 +77,8 @@ pub fn display(vm: &Vm, v: Value, depth: usize) -> String {
             Kind::Cell => display(vm, o.cell().value, depth + 1),
             Kind::Fiber => format!("<fiber {}>", o.fiber().fiber.id),
             Kind::Promise => "<promise>".into(),
-            Kind::Host => "<host object>".into(),
+            Kind::Host => super::ffi::display_host(o).unwrap_or_else(|| "<host object>".into()),
+            Kind::Bytes => format!("<bytes {}>", o.bytes().len()),
             Kind::Signal => format!("<signal {}>", display(vm, o.signal().value, depth + 1)),
             Kind::Reactive => "<computed>".into(),
             Kind::Template => "<view>".into(),
@@ -172,6 +174,12 @@ impl Vm {
     pub(crate) fn get_field(&mut self, obj: Value, sym: u32) -> Result<Value, Value> {
         if let Value::Obj(o) = obj {
             match o.kind() {
+                Kind::Host => {
+                    if let Some(result) = super::ffi::get_field(o, self.syms.name(sym)) {
+                        return result.map_err(|e| self.err(e));
+                    }
+                }
+                Kind::Bytes if self.syms.name(sym) == "length" => return Ok(Value::Int(o.bytes().len() as i64)),
                 Kind::Object => return Ok(o.object().fields.get(sym).unwrap_or(Value::Nil)),
                 Kind::Array if self.syms.name(sym) == "length" => return Ok(Value::Int(o.array().items.len() as i64)),
                 Kind::String if self.syms.name(sym) == "length" => return Ok(Value::Int(o.str().chars().count() as i64)),
@@ -213,6 +221,9 @@ impl Vm {
     pub(crate) fn get_index(&mut self, obj: Value, index: Value) -> Result<Value, Value> {
         if let Value::Obj(o) = obj {
             match (o.kind(), index) {
+                (Kind::Bytes, Value::Int(i)) => {
+                    return Ok(usize::try_from(i).ok().and_then(|i| o.bytes().slice().get(i)).map(|n| Value::Int(*n as i64)).unwrap_or(Value::Nil));
+                }
                 (Kind::Array, Value::Int(i)) => {
                     let a = &o.array().items;
                     return Ok(if i >= 0 && (i as usize) < a.len() { a[i as usize] } else { Value::Nil });
@@ -237,6 +248,13 @@ impl Vm {
     pub(crate) fn set_index(&mut self, obj: Value, index: Value, v: Value) -> Result<(), Value> {
         if let Value::Obj(o) = obj {
             match (o.kind(), index) {
+                (Kind::Bytes, Value::Int(i)) => {
+                    let Some(index) = usize::try_from(i).ok().filter(|i| *i < o.bytes().len()) else { return Err(self.err("Bytes index out of range")); };
+                    let Value::Int(n) = v else { return Err(self.err("Bytes element needs an Int in 0..255")); };
+                    let byte = u8::try_from(n).map_err(|_| self.err("Bytes element needs an Int in 0..255"))?;
+                    unsafe { o.bytes().as_mut_ptr().add(index).write(byte); }
+                    return Ok(());
+                }
                 (Kind::Array, Value::Int(i)) if i >= 0 => {
                     let a = &mut o.array().items;
                     let i = i as usize;
@@ -268,6 +286,7 @@ impl Vm {
     pub(crate) fn is_type(&self, v: Value, name: &str) -> bool {
         match (name, v) {
             ("String", Value::Obj(o)) => o.kind() == Kind::String,
+            ("Bytes", Value::Obj(o)) => o.kind() == Kind::Bytes,
             ("Int", Value::Int(_)) => true,
             ("Float", Value::Float(_) | Value::Int(_)) => true,
             ("Bool", Value::Bool(_)) => true,

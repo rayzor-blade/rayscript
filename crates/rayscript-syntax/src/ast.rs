@@ -32,6 +32,14 @@ pub struct NativeBlock {
     pub library: String,
     pub library_span: Span,
     pub functions: Vec<NativeFn>,
+    pub handles: Vec<NativeHandle>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeHandle {
+    pub meta: Vec<Meta>,
+    pub name: Ident,
     pub span: Span,
 }
 

@@ -354,3 +354,22 @@ fn unclosed_brackets_and_tags_point_back_at_where_they_opened() {
     assert!(d.render("t.rays", src).contains("`<span>` is opened here"));
     assert_eq!(d.labels.len(), 1);
 }
+
+#[test]
+fn native_handles_preserve_destructor_and_owner_metadata() {
+    let source = r#"native "fixture" {
+        @:free(close_session) handle Session;
+        function close_session(session:Session):Void;
+        @:owner(session) function borrow(session:Session):Ptr;
+    }
+    var handle = 1;"#;
+    let parsed = parse(source);
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+    let rayscript_syntax::ast::Item::Native(block) = &parsed.module.items[0] else { panic!("native block") };
+    assert_eq!(block.handles[0].name.name, "Session");
+    assert!(matches!(&block.handles[0].meta[0].args[0].kind, rayscript_syntax::ast::ExprKind::Ident(name) if name == "close_session"));
+    assert!(matches!(&block.functions[1].meta[0].args[0].kind, rayscript_syntax::ast::ExprKind::Ident(name) if name == "session"));
+    for (end, _) in source.char_indices().chain(std::iter::once((source.len(), ' '))) {
+        let _ = parse(&source[..end]);
+    }
+}

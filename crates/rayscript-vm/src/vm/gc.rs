@@ -60,6 +60,7 @@ impl Vm {
             }
         }
         self.heap.end_collect(|h| unsafe { drop_object(h) });
+        self.foreign.drain();
         self.collections += 1;
     }
 
@@ -79,6 +80,7 @@ impl Drop for Vm {
         if !std::thread::panicking() {
             self.heap.begin_collect();
             self.heap.end_collect(|h| unsafe { drop_object(h) });
+            self.foreign.drain();
         }
     }
 }

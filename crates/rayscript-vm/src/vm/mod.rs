@@ -4,7 +4,7 @@
 
 mod debug;
 mod exec;
-mod ffi;
+pub(crate) mod ffi;
 mod gc;
 pub(crate) mod ops;
 mod sched;
@@ -167,6 +167,7 @@ impl Vm {
             debug: Debugger::default(),
         };
         crate::stdlib::install(&mut vm);
+        ffi::install(&mut vm);
         crate::view::install(&mut vm);
         vm
     }
@@ -235,7 +236,7 @@ impl Vm {
 
     /// A host object of type `type_id` holding `data`.
     pub fn new_host(&mut self, type_id: u32, data: Box<dyn std::any::Any>) -> Value {
-        match self.alloc(Kind::Host, |header| HostObj { header, type_id, data }) {
+        match self.alloc(Kind::Host, |header| HostObj { header, type_id, data, references: Vec::new() }) {
             Some(o) => Value::Obj(o),
             None => Value::Nil,
         }

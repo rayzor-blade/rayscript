@@ -357,3 +357,362 @@ fn scalar_call_overhead() {
         println!("median overhead {:.1} ns", deltas[deltas.len() / 2]);
     });
 }
+
+const HANDLES: &str = r#"
+native "fixture" {
+    @:free(close_session) handle Session;
+    @:free(free_record) handle Record;
+    function open_session(out:Out<Session>, id:Int64):Int32;
+    function close_session(session:Session):Void;
+    @:owner(session) function get_record(out:Out<Record>, session:Session, id:Int64):Int32;
+    @:owner(session) function make_record(session:Session, id:Int64):Record;
+    function free_record(record:Record):Void;
+    function session_id(session:Session):Int64;
+    function record_value(record:Record):Int64;
+    function freed_count():SizeT;
+    function freed_at(index:SizeT):Int64;
+    function reset_freed():Void;
+    @:owner(session) function session_ptr(session:Session):Ptr;
+}
+reset_freed();
+function session(id) {
+    var out = Out(Session);
+    if (open_session(out, id) != 0) throw "open failed";
+    return out.value;
+}
+"#;
+
+fn run_handles(vm: &mut Vm, body: &str) -> Value {
+    vm.run_source("handles.rays", &format!("{HANDLES}\n{body}"))
+        .unwrap()
+}
+
+#[test]
+fn typed_output_slots_cover_scalars_strings_and_pointers() {
+    with_vm(|vm| {
+        for (name, ty, literal, expected) in [
+            ("out_i8", "Int8", "-128", "-128"),
+            ("out_i16", "Int16", "-32768", "-32768"),
+            ("out_i32", "Int32", "-2147483648", "-2147483648"),
+            (
+                "out_i64",
+                "Int64",
+                "-9223372036854775807",
+                "-9223372036854775807",
+            ),
+            ("out_u8", "UInt8", "255", "255"),
+            ("out_u16", "UInt16", "65535", "65535"),
+            ("out_u32", "UInt32", "4294967295", "4294967295"),
+            ("out_u64", "UInt64", "-1", "-1"),
+            ("out_size", "SizeT", "-1", "-1"),
+            ("out_bool", "Bool", "true", "true"),
+            ("out_float", "Float", "1.25", "1.25"),
+            ("out_double", "Double", "-2.5", "-2.5"),
+        ] {
+            let source = format!(
+                r#"native "fixture" {{ function {name}(out:Out<{ty}>, value:{ty}):Void; }}
+                var out = Out({ty}); {name}(out, {literal}); gc(); return out.value;"#
+            );
+            let value = vm.run_source("outputs.rays", &source).unwrap();
+            assert_eq!(vm.display(value), expected, "{ty}");
+        }
+        let value = vm.run_source("pointer.rays", r#"
+            native "fixture" {
+                function static_ptr():Ptr;
+                function identity_ptr(p:Ptr):Ptr;
+                function read_ptr(p:Ptr):Int64;
+                function out_ptr(out:Out<Ptr>):Void;
+                function out_string(out:Out<CString>):Void;
+            }
+            var p = Out(Ptr); out_ptr(p);
+            var s = Out(CString); out_string(s); gc();
+            return [read_ptr(p.value), read_ptr(identity_ptr(static_ptr())), identity_ptr(null), s.value];
+        "#).unwrap();
+        assert_eq!(vm.display(value), "[12345,12345,null,output]");
+        let error = vm
+            .run_source(
+                "bad-output.rays",
+                r#"native "fixture" { function out_bad_string(out:Out<CString>):Void; }
+            out_bad_string(Out(CString));"#,
+            )
+            .unwrap_err();
+        assert!(error.contains("not UTF-8"), "{error}");
+    });
+}
+
+#[test]
+fn bytes_are_fixed_size_checked_buffers_and_native_writes_are_visible() {
+    with_vm(|vm| {
+        let value = vm.run_source("bytes.rays", r#"
+            native "fixture" {
+                function fill_bytes(bytes:Bytes, len:SizeT, value:UInt8):Void;
+                function sum_bytes(bytes:Ptr, len:SizeT):UInt64;
+            }
+            var bytes = Bytes(3);
+            fill_bytes(bytes, bytes.length, 65);
+            var copy = bytes.copy(); bytes[1] = 66; gc();
+            return [bytes.toString(), copy.toString(), sum_bytes(bytes, bytes.length), Bytes([0,255])[1], Bytes('é').length, bytes[-1], bytes[3]];
+        "#).unwrap();
+        assert_eq!(vm.display(value), "[ABA,AAA,196,255,2,null,null]");
+        for source in [
+            "Bytes(-1);",
+            "Bytes([256]);",
+            "Bytes([true]);",
+            "Bytes(2)[2] = 1;",
+            "Bytes(2)[-1] = 1;",
+            "Bytes(2)[0] = -1;",
+            "Bytes(2)[0] = 256;",
+            "Bytes(2)[0] = true;",
+            "Bytes([255]).toString();",
+        ] {
+            assert!(vm.run_source("bad-bytes.rays", source).is_err(), "{source}");
+        }
+    });
+}
+
+#[test]
+fn closing_an_owner_frees_children_first_and_invalidates_every_alias() {
+    with_vm(|vm| {
+        let value = run_handles(
+            vm,
+            r#"
+            var s = session(7);
+            var out = Out(Record); get_record(out, s, 3);
+            var child = out.value;
+            var pointer = session_ptr(s);
+            var before = record_value(child);
+            s.close(); s.close(); close_session(s);
+            var errors = 0;
+            try { record_value(child); } catch (e) { errors += 1; }
+            try { session_id(s); } catch (e) { errors += 1; }
+            try { session_ptr(s); } catch (e) { errors += 1; }
+            native "fixture" { function identity_ptr(p:Ptr):Ptr; }
+            try { identity_ptr(pointer); } catch (e) { errors += 1; }
+            return [before, freed_count(), freed_at(0), freed_at(1), s == null, child == null, !s, !pointer, errors];
+        "#,
+        );
+        assert_eq!(vm.display(value), "[703,2,703,7,true,true,true,true,4]");
+    });
+}
+
+#[test]
+fn a_child_traces_its_owner_and_collection_frees_child_before_parent() {
+    with_vm(|vm| {
+        let record = run_handles(
+            vm,
+            r#"
+            function child() {
+                var s = session(8);
+                var out = Out(Record); get_record(out, s, 4);
+                return out.value;
+            }
+            return child();
+        "#,
+        );
+        vm.define_global("kept", record);
+        vm.collect();
+        let count = vm.module_global(0, "freed_count").unwrap();
+        let read = vm.module_global(0, "record_value").unwrap();
+        assert_eq!(call_text(vm, count, &[]).unwrap(), "0");
+        assert_eq!(call_text(vm, read, &[record]).unwrap(), "804");
+        vm.define_global("kept", Value::Nil);
+        vm.collect();
+        assert_eq!(call_text(vm, count, &[]).unwrap(), "2");
+        let at = vm.module_global(0, "freed_at").unwrap();
+        assert_eq!(call_text(vm, at, &[Value::Int(0)]).unwrap(), "804");
+        assert_eq!(call_text(vm, at, &[Value::Int(1)]).unwrap(), "8");
+    });
+}
+
+#[test]
+fn direct_free_and_out_reuse_share_the_same_handle_lifetime() {
+    with_vm(|vm| {
+        let value = run_handles(
+            vm,
+            r#"
+            var out = Out(Session); open_session(out, 2);
+            var first = out.value;
+            var errors = 0;
+            try { open_session(out, 3); } catch (e) { errors += 1; }
+            close_session(first);
+            open_session(out, 3);
+            var second = out.value;
+            var r = make_record(second, 5);
+            free_record(r); r.close();
+            close_session(second);
+            var failed = Out(Session); var code = open_session(failed, -1);
+            return [errors, first == null, second == null, r == null, freed_count(), freed_at(0), freed_at(1), freed_at(2), code, failed.value];
+        "#,
+        );
+        assert_eq!(vm.display(value), "[1,true,true,true,3,2,305,3,-1,null]");
+    });
+}
+
+#[test]
+fn aliases_of_a_returned_handle_are_freed_once() {
+    with_vm(|vm| {
+        let value = run_handles(
+            vm,
+            r#"
+            native "fixture" { function identity_ptr(value:Session):Session; }
+            var s = session(9);
+            var alias = identity_ptr(s);
+            alias.close(); s.close();
+            return [s == null, freed_count()];
+        "#,
+        );
+        assert_eq!(vm.display(value), "[true,1]");
+    });
+}
+
+#[test]
+fn malformed_handle_declarations_and_output_type_mismatches_are_errors() {
+    with_vm(|vm| {
+        for source in [
+            r#"native "fixture" { handle Session; }"#,
+            r#"native "fixture" { @:free(12) handle Session; }"#,
+            r#"native "fixture" { @:free(close_session) handle Session; }"#,
+            r#"native "fixture" { @:owner(nope) function identity_ptr(p:Ptr):Ptr; }"#,
+            r#"native "fixture" { @:owner(p) function identity_ptr(p:Ptr):Ptr; }"#,
+            r#"native "fixture" { function out_i32(out:Out<Out<Int32>>, value:Int32):Void; }"#,
+            "Out(Void);",
+            "Out(Bytes);",
+        ] {
+            assert!(
+                vm.run_source("bad-native.rays", source).is_err(),
+                "{source}"
+            );
+        }
+        for source in [
+            r#"native "fixture" { function out_i32(out:Out<Int32>, value:Int32):Void; } out_i32(Out(Int64), 1);"#,
+            r#"native "fixture" { function identity_ptr(p:Ptr):Ptr; } identity_ptr(123);"#,
+            r#"native "fixture" { function sum_bytes(b:Bytes, len:SizeT):UInt64; } sum_bytes('abc', 3);"#,
+        ] {
+            let error = vm.run_source("bad-call.rays", source).unwrap_err();
+            assert!(error.contains("argument 1"), "{error}");
+        }
+        let error = vm
+            .run_source(
+                "bad-handle.rays",
+                &format!("{HANDLES}\nrecord_value(session(1));"),
+            )
+            .unwrap_err();
+        assert!(error.contains("expected handle fixture.Record"), "{error}");
+    });
+}
+
+#[test]
+fn finalizers_retain_the_original_library_after_registration_changes_and_vm_drop() {
+    std::thread::Builder::new()
+        .stack_size(16 << 20)
+        .spawn(|| {
+            let mut observer = Vm::new();
+            unsafe {
+                observer.register_native_library("fixture", rayscript_ffi_fixture::LIBRARY_PATH);
+            }
+            let count = bind(
+                &mut observer,
+                "function freed_count():SizeT;",
+                "freed_count",
+            );
+            {
+                let mut vm = Vm::new();
+                unsafe {
+                    vm.register_native_library("fixture", rayscript_ffi_fixture::LIBRARY_PATH);
+                }
+                run_handles(
+                    &mut vm,
+                    "var s = session(6); var child = make_record(s, 2);",
+                );
+                unsafe {
+                    vm.register_native_library("fixture", "/no/such/replacement");
+                }
+            }
+            assert_eq!(call_text(&mut observer, count, &[]).unwrap(), "2");
+            let at = bind(
+                &mut observer,
+                "function freed_at(index:SizeT):Int64;",
+                "freed_at",
+            );
+            assert_eq!(
+                call_text(&mut observer, at, &[Value::Int(0)]).unwrap(),
+                "602"
+            );
+            assert_eq!(call_text(&mut observer, at, &[Value::Int(1)]).unwrap(), "6");
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn copying_native_data_and_borrowed_pointer_ownership_are_explicit() {
+    with_vm(|vm| {
+        let value = vm.run_source("copy.rays", r#"
+            native "fixture" { function greeting():Ptr; }
+            var source = Bytes('abc');
+            return [Bytes(greeting(), 6).toString(), Bytes(source, 2).toString(), Bytes(null, 0).length];
+        "#).unwrap();
+        assert_eq!(vm.display(value), "[héllo,ab,0]");
+        for source in ["Bytes(null, 1);", "Bytes(null, -1);", "Bytes(Bytes(2), 3);"] {
+            assert!(vm.run_source("bad-copy.rays", source).is_err(), "{source}");
+        }
+        let pointer = run_handles(
+            vm,
+            "function borrowed() { return session_ptr(session(12)); } return borrowed();",
+        );
+        vm.define_global("borrowed", pointer);
+        vm.collect();
+        let count = bind(vm, "function freed_count():SizeT;", "freed_count");
+        assert_eq!(call_text(vm, count, &[]).unwrap(), "0");
+        let read = bind(vm, "function read_ptr(p:Ptr):Int64;", "read_ptr");
+        assert_eq!(call_text(vm, read, &[pointer]).unwrap(), "12");
+        vm.define_global("borrowed", Value::Nil);
+        vm.collect();
+        assert_eq!(call_text(vm, count, &[]).unwrap(), "1");
+    });
+}
+
+#[test]
+fn aliased_buffers_are_valid_and_aliased_output_slots_are_rejected() {
+    with_vm(|vm| {
+        let value = vm
+            .run_source(
+                "aliases.rays",
+                r#"
+            native "fixture" {
+                function copy_bytes(out:Bytes, source:Bytes, length:SizeT):Void;
+                function two_outputs(a:Out<Int32>, b:Out<Int32>):Void;
+            }
+            var bytes = Bytes('test'); copy_bytes(bytes, bytes, bytes.length);
+            var a = Out(Int32); var b = Out(Int32); two_outputs(a, b);
+            var error = false;
+            try { two_outputs(a, a); } catch (e) { error = true; }
+            return [bytes.toString(), a.value, b.value, error];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(vm.display(value), "[test,1,2,true]");
+    });
+}
+
+#[test]
+fn an_output_decode_error_still_wraps_other_owned_outputs() {
+    with_vm(|vm| {
+        let value = run_handles(
+            vm,
+            r#"
+            native "fixture" {
+                function handle_and_bad_string(text:Out<CString>, out:Out<Session>):Void;
+            }
+            var text = Out(CString); var out = Out(Session);
+            var error = false;
+            try { handle_and_bad_string(text, out); } catch (e) { error = true; }
+            var id = session_id(out.value);
+            out.value.close();
+            return [error, text.value, id, freed_count()];
+        "#,
+        );
+        assert_eq!(vm.display(value), "[true,null,15,1]");
+    });
+}

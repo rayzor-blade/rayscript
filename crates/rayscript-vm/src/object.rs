@@ -27,6 +27,7 @@ pub enum Kind {
     Reactive,
     Template,
     Props,
+    Bytes,
 }
 
 impl Kind {
@@ -46,6 +47,7 @@ impl Kind {
             12 => Kind::Reactive,
             13 => Kind::Template,
             14 => Kind::Props,
+            15 => Kind::Bytes,
             _ => unreachable!("a header with an unknown kind"),
         }
     }
@@ -71,6 +73,7 @@ impl Kind {
             Kind::Reactive => "Computed",
             Kind::Template => "View",
             Kind::Props => "Props",
+            Kind::Bytes => "Bytes",
         }
     }
 }
@@ -79,6 +82,24 @@ impl Kind {
 pub struct StringObj {
     pub header: Header,
     pub text: Box<str>,
+}
+
+#[repr(C)]
+pub struct BytesObj {
+    pub header: Header,
+    pub data: Box<[std::cell::UnsafeCell<u8>]>,
+}
+
+impl BytesObj {
+    pub fn len(&self) -> usize { self.data.len() }
+
+    /// Interior mutable storage keeps repeated pointer arguments valid without exclusive reborrows.
+    pub fn as_mut_ptr(&self) -> *mut u8 { self.data.as_ptr().cast::<u8>().cast_mut() }
+
+    /// Read between native calls; C must not retain a buffer or write from another thread.
+    pub fn slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.as_mut_ptr(), self.len()) }
+    }
 }
 
 #[repr(C)]
@@ -146,6 +167,8 @@ pub struct HostObj {
     pub header: Header,
     pub type_id: u32,
     pub data: Box<dyn Any>,
+    /// Script values retained by opaque host data, traced by the collector.
+    pub references: Vec<Value>,
 }
 
 impl Obj {
@@ -160,6 +183,11 @@ impl Obj {
     pub fn string<'a>(self) -> &'a StringObj {
         debug_assert_eq!(self.kind(), Kind::String);
         unsafe { &*(self.0.as_ptr() as *const StringObj) }
+    }
+
+    pub fn bytes<'a>(self) -> &'a BytesObj {
+        debug_assert_eq!(self.kind(), Kind::Bytes);
+        unsafe { &*(self.0.as_ptr() as *const BytesObj) }
     }
 
     pub fn array<'a>(self) -> &'a mut ArrayObj {
@@ -222,6 +250,11 @@ impl Obj {
         unsafe { &mut *(self.0.as_ptr() as *mut PropsObj) }
     }
 
+    pub fn host_ref<'a>(self) -> &'a HostObj {
+        debug_assert_eq!(self.kind(), Kind::Host);
+        unsafe { &*(self.0.as_ptr() as *const HostObj) }
+    }
+
     pub fn host<'a>(self) -> &'a mut HostObj {
         debug_assert_eq!(self.kind(), Kind::Host);
         unsafe { &mut *(self.0.as_ptr() as *mut HostObj) }
@@ -235,7 +268,8 @@ impl Obj {
 /// Calls `f` with each value an object refers to, for the collector to mark.
 pub fn trace_children(obj: Obj, f: &mut dyn FnMut(Value)) {
     match obj.kind() {
-        Kind::String | Kind::Range | Kind::Host => {}
+        Kind::String | Kind::Range | Kind::Bytes => {}
+        Kind::Host => { for value in &obj.host_ref().references { f(*value); } }
         Kind::Array => {
             for v in &obj.array().items {
                 f(*v);
@@ -296,6 +330,7 @@ pub unsafe fn drop_object(hdr: *mut Header) {
     unsafe {
         match obj.kind() {
             Kind::String => std::ptr::drop_in_place(hdr as *mut StringObj),
+            Kind::Bytes => std::ptr::drop_in_place(hdr as *mut BytesObj),
             Kind::Array => std::ptr::drop_in_place(hdr as *mut ArrayObj),
             Kind::Object => std::ptr::drop_in_place(hdr as *mut ObjectObj),
             Kind::Map => std::ptr::drop_in_place(hdr as *mut MapObj),

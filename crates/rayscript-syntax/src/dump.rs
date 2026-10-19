@@ -22,6 +22,13 @@ pub fn dump_item(item: &Item) -> String {
         }
         Item::Native(n) => {
             let mut s = format!("(native {:?}", n.library);
+            for h in &n.handles {
+                write!(s, " (handle {}", h.name.name).unwrap();
+                for m in &h.meta {
+                    write!(s, " @{}", m.name).unwrap();
+                }
+                s.push(')');
+            }
             for f in &n.functions {
                 write!(s, " (fn {} ({})", f.name.name, params(&f.params)).unwrap();
                 if let Some(r) = &f.ret {

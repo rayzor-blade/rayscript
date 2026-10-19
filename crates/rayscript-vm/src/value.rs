@@ -22,12 +22,12 @@ pub enum Value {
 
 impl Value {
     pub fn is_nil(&self) -> bool {
-        matches!(self, Value::Nil)
+        matches!(self, Value::Nil) || crate::vm::ffi::closed(*self)
     }
 
-    /// Only `null` and `false` are false.
+    /// Null, false and closed native handles or borrowed pointers are false.
     pub fn truthy(&self) -> bool {
-        !matches!(self, Value::Nil | Value::Bool(false))
+        !matches!(self, Value::Nil | Value::Bool(false)) && !crate::vm::ffi::closed(*self)
     }
 
     pub fn as_obj(&self) -> Option<Obj> {

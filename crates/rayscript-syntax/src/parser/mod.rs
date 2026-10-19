@@ -271,16 +271,23 @@ impl<'a> Parser<'a> {
             }
         };
         let mut functions = Vec::new();
+        let mut handles = Vec::new();
         if self.expect(&TokenKind::LBrace) {
             while !self.is(&TokenKind::RBrace) && !self.is(&TokenKind::Eof) {
                 let before = self.cur.span.start;
                 let meta = self.parse_meta();
                 if self.is_kw(Kw::Function) {
                     functions.push(self.parse_native_fn(meta));
+                } else if matches!(&self.cur.kind, TokenKind::Ident(n) if n == "handle") {
+                    let start = self.cur.span.start;
+                    self.advance();
+                    let name = self.expect_ident("a handle name");
+                    self.expect(&TokenKind::Semi);
+                    handles.push(NativeHandle { meta, name, span: Span::new(start, self.prev_end) });
                 } else {
                     let found = self.cur.kind.describe();
                     let span = self.cur.span;
-                    self.error(span, format!("expected `function` in a native block, found {found}"));
+                    self.error(span, format!("expected `function` or `handle` in a native block, found {found}"));
                     self.synchronize();
                 }
                 if self.cur.span.start == before {
@@ -289,7 +296,7 @@ impl<'a> Parser<'a> {
             }
             self.expect(&TokenKind::RBrace);
         }
-        NativeBlock { library, library_span, functions, span: Span::new(start, self.prev_end) }
+        NativeBlock { library, library_span, functions, handles, span: Span::new(start, self.prev_end) }
     }
 
     fn parse_native_fn(&mut self, meta: Vec<Meta>) -> NativeFn {

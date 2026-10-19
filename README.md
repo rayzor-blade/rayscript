@@ -123,7 +123,7 @@ fn main() {
 
 ## Status
 
-- [Native calls](docs/native.md) bind scalar C functions from libraries explicitly registered by the embedding application. Pointers, handles, structs and callbacks are not implemented yet.
+- [Native calls](docs/native.md) bind C functions from explicitly registered libraries, with scalars, strings, pointers, output slots, owned handles and byte buffers. Structs, callbacks and worker lanes are not implemented yet.
 - No release yet; build from source with `cargo build --release`. `cargo test` runs the suite.
 
 MIT OR Apache-2.0.

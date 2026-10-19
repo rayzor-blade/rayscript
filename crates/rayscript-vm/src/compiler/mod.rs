@@ -407,6 +407,37 @@ impl Compiler {
             self.error(n.library_span, "a native library needs a nonempty name without NUL characters");
             return;
         }
+        let ty = |t: &Option<ast::Type>| t.as_ref().map(rayscript_syntax::dump::ty).unwrap_or_else(|| "Void".to_string());
+        let mut names = std::collections::HashSet::new();
+        for h in &n.handles {
+            self.at(h.span);
+            if !names.insert(&h.name.name) {
+                self.error(h.span, "duplicate native handle name");
+            }
+            let free = match h.meta.as_slice() {
+                [meta] if meta.name == ":free" => match meta.args.as_slice() {
+                    [ast::Expr { kind: ast::ExprKind::Ident(name), .. }] => Some(name.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(free) = free else {
+                self.error(h.span, "a native handle needs exactly one @:free(function) annotation");
+                continue;
+            };
+            if !n.functions.iter().any(|f| f.name.name == free && f.params.len() == 1
+                && ty(&f.params[0].ty) == h.name.name && ty(&f.ret) == "Void" && f.meta.is_empty()) {
+                self.error(h.span, format!("handle {} needs `function {}(value:{}):Void;` in its native block", h.name.name, free, h.name.name));
+            }
+            let spec = format!("{}\0{}\0handle\0{}", n.library, h.name.name, free);
+            let k = self.const_str(&spec);
+            let m = self.mark();
+            let t = self.alloc();
+            self.emit(Op::BindNative { dst: t, spec: k });
+            let name = self.const_str(&h.name.name);
+            self.emit(Op::DefGlobal { src: t, name });
+            self.free_to(m);
+        }
         for f in &n.functions {
             for param in &f.params {
                 if param.rest || param.optional || param.default.is_some() {
@@ -416,7 +447,22 @@ impl Compiler {
             self.at(f.span);
             let ty = |t: &Option<ast::Type>| t.as_ref().map(rayscript_syntax::dump::ty).unwrap_or_else(|| "Void".to_string());
             let sig = format!("{}->{}", f.params.iter().map(|p| ty(&p.ty)).collect::<Vec<_>>().join(","), ty(&f.ret));
-            let flags = f.meta.iter().map(|m| m.name.trim_start_matches(':').to_string()).collect::<Vec<_>>().join(",");
+            let mut flags = Vec::new();
+            for meta in &f.meta {
+                if meta.name == ":owner" {
+                    let parameter = match meta.args.as_slice() {
+                        [ast::Expr { kind: ast::ExprKind::Ident(name), .. }] => f.params.iter().position(|p| p.name.name == *name),
+                        _ => None,
+                    };
+                    match parameter {
+                        Some(index) => flags.push(format!("owner={index}")),
+                        None => self.error(meta.span, "@:owner needs the name of a native parameter"),
+                    }
+                } else {
+                    flags.push(meta.name.trim_start_matches(':').to_string());
+                }
+            }
+            let flags = flags.join(",");
             let spec = format!("{}\0{}\0{}\0{}", n.library, f.name.name, sig, flags);
             let k = self.const_str(&spec);
             let m = self.mark();
