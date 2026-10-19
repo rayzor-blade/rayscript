@@ -123,7 +123,7 @@ fn main() {
 
 ## Status
 
-- [Native calls](docs/native.md) bind C functions from explicitly registered libraries, with scalars, strings, pointers, output slots, owned handles, byte buffers, C-aligned structs and struct arrays. Callbacks and worker lanes are not implemented yet.
+- [Native calls](docs/native.md) bind C functions from explicitly registered libraries, with scalars, strings, pointers, output slots, owned handles, byte buffers, C-aligned structs, struct arrays and callbacks on the VM thread. Worker lanes are not implemented yet.
 - No release yet; build from source with `cargo build --release`. `cargo test` runs the suite.
 
 MIT OR Apache-2.0.

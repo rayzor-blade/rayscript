@@ -482,3 +482,188 @@ pub extern "C" fn static_node() -> *mut Node {
     thread_local! { static NODE: std::cell::UnsafeCell<Node> = const { std::cell::UnsafeCell::new(Node { value: 0, next: std::ptr::null_mut(), name: c"static".as_ptr() }) }; }
     NODE.with(|n| n.get())
 }
+
+type Visit = unsafe extern "C" fn(i32, *mut std::ffi::c_void) -> i32;
+thread_local! { static CALLBACK_RESULTS: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) }; }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visit(
+    callback: Option<Visit>,
+    data: *mut std::ffi::c_void,
+    count: i32,
+) -> i32 {
+    let mut result = 0;
+    for index in 0..count {
+        let value = callback.map_or(0, |f| unsafe { f(index, data) });
+        CALLBACK_RESULTS.with(|v| v.borrow_mut().push(value));
+        result += value;
+    }
+    result
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn callback_result(index: usize) -> i32 {
+    CALLBACK_RESULTS.with(|v| v.borrow()[index])
+}
+
+thread_local! { static CALLBACK_BITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+#[unsafe(no_mangle)]
+pub extern "C" fn callback_bits() -> u64 {
+    CALLBACK_BITS.with(|v| v.get())
+}
+
+macro_rules! callback_identity {
+    ($name:ident, $ty:ty) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $name(
+            callback: unsafe extern "C" fn($ty) -> $ty,
+            value: $ty,
+        ) -> $ty {
+            let result = unsafe { callback(value) };
+            let mut bytes = [0u8; 8];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (&result as *const $ty).cast::<u8>(),
+                    bytes.as_mut_ptr(),
+                    std::mem::size_of::<$ty>(),
+                )
+            };
+            CALLBACK_BITS.with(|v| v.set(u64::from_ne_bytes(bytes)));
+            result
+        }
+    };
+}
+callback_identity!(callback_i8, i8);
+callback_identity!(callback_i16, i16);
+callback_identity!(callback_i32, i32);
+callback_identity!(callback_i64, i64);
+callback_identity!(callback_u8, u8);
+callback_identity!(callback_u16, u16);
+callback_identity!(callback_u32, u32);
+callback_identity!(callback_u64, u64);
+callback_identity!(callback_size, usize);
+callback_identity!(callback_bool, bool);
+callback_identity!(callback_float, f32);
+callback_identity!(callback_double, f64);
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn callback_mixed(
+    callback: unsafe extern "C" fn(i8, u16, i64, f32, f64, *const c_char) -> f64,
+) -> f64 {
+    unsafe { callback(-12, 65000, -400, 1.25, 2.5, c"h\u{e9}llo".as_ptr()) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn callback_strings(
+    callback: unsafe extern "C" fn(*const c_char) -> *const c_char,
+) -> *const c_char {
+    let first = unsafe { callback(c"first".as_ptr()) };
+    unsafe { callback(c"second".as_ptr()) };
+    first
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn callback_void(callback: unsafe extern "C" fn()) {
+    unsafe { callback() };
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn callback_pointer(callback: unsafe extern "C" fn() -> *const u8) -> u8 {
+    unsafe { *callback() }
+}
+
+#[repr(C)]
+pub struct VisitOptions {
+    callback: Option<Visit>,
+    data: *mut std::ffi::c_void,
+    label: *const c_char,
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visit_options(options: *mut VisitOptions) -> i32 {
+    let callback = unsafe { (*options).callback.unwrap() };
+    let data = unsafe { (*options).data };
+    let label = unsafe { (*options).label };
+    let a = unsafe { callback(1, data) };
+    let b = unsafe { callback(2, data) };
+    a + b + unsafe { CStr::from_ptr(label) }.to_bytes().len() as i32
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visit_session(
+    session: *mut Session,
+    callback: Visit,
+    data: *mut std::ffi::c_void,
+) -> i64 {
+    let before = unsafe { (*session).id };
+    unsafe { callback(0, data) };
+    before + unsafe { (*session).id }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visit_record(
+    out: *mut *mut Record,
+    session: *mut Session,
+    callback: Visit,
+) {
+    unsafe { callback(0, std::ptr::null_mut()) };
+    unsafe { *out = make_record(session, 3) };
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn visit_output(out: *mut i32, callback: Visit) {
+    unsafe {
+        *out = 1;
+        callback(0, std::ptr::null_mut());
+        *out += 10;
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn callback_pair(callback: unsafe extern "C" fn(*mut Pair) -> i32) -> i32 {
+    let mut pair = Pair { x: 9, y: 2.5 };
+    unsafe { callback(&mut pair) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn callback_session(
+    callback: unsafe extern "C" fn(*mut Session) -> i64,
+) -> i64 {
+    let mut session = Session { id: 19 };
+    unsafe { callback(&mut session) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn callback_worker(callback: Visit) -> i32 {
+    std::thread::spawn(move || unsafe { callback(7, std::ptr::null_mut()) })
+        .join()
+        .unwrap()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn callback_owned_session(
+    session: *mut Session,
+    callback: unsafe extern "C" fn(*mut Session) -> i64,
+) -> i64 {
+    unsafe { callback(session) + (*session).id }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn callback_closed_alias(
+    session: *mut Session,
+    callback: Visit,
+) -> *mut Session {
+    unsafe { callback(0, std::ptr::null_mut()) };
+    session
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn callback_owned_pair(pair: *mut Pair, callback: Visit) -> i32 {
+    unsafe {
+        callback(0, std::ptr::null_mut());
+        (*pair).x
+    }
+}
+
+thread_local! { static REGISTERED_VISIT: std::cell::Cell<Option<(Visit, *mut std::ffi::c_void)>> = const { std::cell::Cell::new(None) }; }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn register_visit(callback: Visit, data: *mut std::ffi::c_void) {
+    REGISTERED_VISIT.with(|slot| slot.set(Some((callback, data))));
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn run_registered_visit() -> i32 {
+    let (callback, data) = REGISTERED_VISIT.with(|slot| slot.get().unwrap());
+    unsafe { callback(1, data) + *data.cast::<u8>() as i32 }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn unregister_visit() {
+    REGISTERED_VISIT.with(|slot| slot.set(None));
+}

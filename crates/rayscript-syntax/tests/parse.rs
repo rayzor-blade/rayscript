@@ -386,3 +386,21 @@ fn native_structs_parse_nested_fields_and_pointer_links() {
     for (end, _) in source.char_indices().chain(std::iter::once((source.len(), ' '))) { let _ = parse(&source[..end]); }
     has_error("native \"fixture\" { @:packed struct Pair { x:Int32; } }", "struct annotations are not supported");
 }
+
+#[test]
+fn native_callbacks_keep_signatures_and_failure_literals() {
+    let source = r#"native "fixture" {
+        @:failure(-1) callback Visit(value:Int32, data:Ptr):Int32;
+        callback Done():Void;
+        struct Options { visit:Visit; }
+    }"#;
+    let parsed = parse(source);
+    assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+    let rayscript_syntax::ast::Item::Native(block) = &parsed.module.items[0] else { panic!("native block") };
+    assert_eq!(block.callbacks.len(), 2);
+    assert_eq!(block.callbacks[0].name.name, "Visit");
+    assert_eq!(block.callbacks[0].params.len(), 2);
+    assert_eq!(block.callbacks[0].meta[0].name, ":failure");
+    assert!(tree(source).contains("(callback Visit (value:Int32 data:Ptr) Int32 @:failure)"));
+    for (end, _) in source.char_indices().chain(std::iter::once((source.len(), ' '))) { let _ = parse(&source[..end]); }
+}

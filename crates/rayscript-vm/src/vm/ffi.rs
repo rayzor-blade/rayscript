@@ -1,6 +1,7 @@
 //! C calls with typed output slots and traced native ownership. Library names are resolved only through the embedder's explicit registrations.
 
-mod structure;
+mod callback;
+pub(crate) mod structure;
 
 use super::{NativeResult, Vm};
 use crate::{Value, object::Kind};
@@ -8,7 +9,7 @@ use libffi::middle::{Cif, CodePtr, Type};
 use libloading::Library;
 use std::{
     cell::{Cell, RefCell, UnsafeCell},
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ffi::{CStr, CString, c_char, c_void},
     path::{Path, PathBuf},
     rc::{Rc, Weak},
@@ -20,10 +21,14 @@ pub(crate) struct Libraries {
     loaded: HashMap<String, Rc<Library>>,
     types: HashMap<(String, String), Rc<HandleType>>,
     structures: HashMap<(String, String), structure::StructType>,
+    callbacks: HashMap<(String, String), Rc<callback::CallbackType>>,
+    callback_instances: Vec<Weak<callback::Callback>>,
+    identity: Rc<()>,
+    frames: Vec<callback::Frame>,
     struct_backings: Vec<Weak<structure::Backing>>,
     struct_bytes: Rc<Cell<usize>>,
     accounted_struct_bytes: usize,
-    releases: Rc<RefCell<Vec<Release>>>,
+    releases: Rc<RefCell<VecDeque<Release>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -130,6 +135,7 @@ enum NativeType {
     Bytes,
     Handle(Rc<HandleType>),
     Struct(structure::StructType),
+    Callback(Rc<callback::CallbackType>),
     Out(Box<NativeType>),
 }
 
@@ -137,7 +143,10 @@ impl NativeType {
     fn parse(name: &str, library: &str, libraries: &Libraries) -> Result<Self, String> {
         if let Some(inner) = name.strip_prefix("Out<").and_then(|s| s.strip_suffix('>')) {
             let ty = Self::parse(inner, library, libraries)?;
-            if matches!(ty, Self::Out(_) | Self::Bytes | Self::Scalar(Scalar::Void)) {
+            if matches!(
+                ty,
+                Self::Out(_) | Self::Bytes | Self::Callback(_) | Self::Scalar(Scalar::Void)
+            ) {
                 return Err(format!("unsupported output type `{inner}`"));
             }
             return Ok(Self::Out(Box::new(ty)));
@@ -152,6 +161,9 @@ impl NativeType {
         }
         if let Some(ty) = libraries.structures.get(&(library.into(), name.into())) {
             return Ok(Self::Struct(ty.clone()));
+        }
+        if let Some(ty) = libraries.callbacks.get(&(library.into(), name.into())) {
+            return Ok(Self::Callback(ty.clone()));
         }
         Ok(match name {
             "Ptr" => Self::Ptr,
@@ -176,6 +188,7 @@ impl NativeType {
             (Self::Ptr, Self::Ptr) | (Self::Bytes, Self::Bytes) => true,
             (Self::Handle(a), Self::Handle(b)) => Rc::ptr_eq(a, b),
             (Self::Struct(a), Self::Struct(b)) => a.same(b),
+            (Self::Callback(a), Self::Callback(b)) => Rc::ptr_eq(a, b),
             (Self::Out(a), Self::Out(b)) => a.same(b),
             _ => false,
         }
@@ -195,10 +208,11 @@ struct Resource {
     ty: Rc<HandleType>,
     parent: Option<Rc<Resource>>,
     children: RefCell<Vec<Weak<Resource>>>,
-    releases: Rc<RefCell<Vec<Release>>>,
+    releases: Rc<RefCell<VecDeque<Release>>>,
 }
 
 struct Release {
+    resource: usize,
     ptr: *mut c_void,
     ty: Rc<HandleType>,
     // Retained until the child has been freed, independently of heap sweep order.
@@ -216,7 +230,12 @@ impl Resource {
         }
         self.ty.live.borrow_mut().remove(&(ptr as usize));
         // The declaration and library registration guarantee a one-pointer C destructor.
-        unsafe { (self.ty.free)(ptr) };
+        self.releases.borrow_mut().push_back(Release {
+            resource: self as *const Self as usize,
+            ptr,
+            ty: self.ty.clone(),
+            _parent: self.parent.clone(),
+        });
     }
 }
 
@@ -225,7 +244,8 @@ impl Drop for Resource {
         let ptr = self.ptr.get();
         if !ptr.is_null() {
             self.ty.live.borrow_mut().remove(&(ptr as usize));
-            self.releases.borrow_mut().push(Release {
+            self.releases.borrow_mut().push_back(Release {
+                resource: self as *const Self as usize,
                 ptr,
                 ty: self.ty.clone(),
                 _parent: self.parent.take(),
@@ -244,6 +264,7 @@ enum Foreign {
     },
     Handle(Rc<Resource>),
     Struct(structure::View),
+    Callback(Rc<callback::Callback>),
     BorrowedHandle {
         ty: Rc<HandleType>,
         ptr: *mut c_void,
@@ -269,8 +290,17 @@ pub(crate) fn closed(value: Value) -> bool {
     structure::storage_closed_value(value, &mut std::collections::HashSet::new())
 }
 
+pub(crate) fn trace_bytes(obj: crate::value::Obj, f: &mut dyn FnMut(Value)) {
+    if let Some(backing) = obj.bytes().native_backing.borrow().as_ref() {
+        backing.trace(f);
+    }
+}
+
 pub(crate) fn trace_host(obj: crate::value::Obj, f: &mut dyn FnMut(Value)) {
     structure::trace(Value::Obj(obj), f);
+    if let Some(Foreign::Callback(callback)) = foreign(Value::Obj(obj)) {
+        f(callback.callable());
+    }
 }
 
 pub(crate) fn set_field(
@@ -312,6 +342,7 @@ pub(crate) fn display_host(obj: crate::value::Obj) -> Option<String> {
             }
         }
         Foreign::Out { .. } => "<out>".into(),
+        Foreign::Callback(_) => "<native callback>".into(),
         Foreign::Struct(_) => if closed(Value::Obj(obj)) {
             "null"
         } else {
@@ -466,9 +497,27 @@ pub(crate) fn install(vm: &mut Vm) {
 
 impl Libraries {
     pub(crate) fn drain(&mut self) {
+        if !self.frames.is_empty() {
+            return;
+        }
         // Drop each entry outside the queue borrow: releasing its owner may enqueue another free.
         loop {
-            let next = self.releases.borrow_mut().pop();
+            let next = {
+                let mut queue = self.releases.borrow_mut();
+                let index = queue.iter().position(|candidate| {
+                    !queue.iter().any(|child| {
+                        let mut parent = child._parent.as_ref();
+                        while let Some(owner) = parent {
+                            if Rc::as_ptr(owner) as usize == candidate.resource {
+                                return true;
+                            }
+                            parent = owner.parent.as_ref();
+                        }
+                        false
+                    })
+                });
+                index.and_then(|index| queue.remove(index))
+            };
             let Some(release) = next else { break };
             unsafe { (release.ty.free)(release.ptr) };
         }
@@ -501,16 +550,20 @@ impl Vm {
 
     /// A fixed-size native buffer. Scripts read and write bytes by index.
     pub fn new_bytes(&mut self, data: Vec<u8>) -> Value {
-        self.alloc(Kind::Bytes, |header| crate::object::BytesObj {
-            header,
-            data: data
-                .into_iter()
-                .map(UnsafeCell::new)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        })
-        .map(Value::Obj)
-        .unwrap_or(Value::Nil)
+        let value = self
+            .alloc(Kind::Bytes, |header| crate::object::BytesObj {
+                header,
+                native_backing: RefCell::new(None),
+                data: data
+                    .into_iter()
+                    .map(UnsafeCell::new)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            })
+            .map(Value::Obj)
+            .unwrap_or(Value::Nil);
+        structure::register_bytes(self, value);
+        value
     }
 
     /// Registers a logical name for native declarations; binding loads the registered path lazily.
@@ -524,6 +577,9 @@ impl Vm {
             .paths
             .insert(name.into(), path.as_ref().to_path_buf());
         self.foreign.loaded.remove(name);
+        self.foreign
+            .callbacks
+            .retain(|(library, _), _| library != name);
         self.foreign.types.retain(|(library, _), _| library != name);
         self.foreign
             .structures
@@ -565,6 +621,13 @@ impl Vm {
         flags: &str,
         name: &str,
     ) -> Result<Value, String> {
+        if signature == "callback-check" {
+            callback::validate(self, library, symbol)?;
+            return Ok(Value::Nil);
+        }
+        if signature == "callback" {
+            return callback::bind(self, library, symbol, flags);
+        }
         if signature == "struct" {
             return structure::bind(self, library, symbol, flags);
         }
@@ -575,6 +638,13 @@ impl Vm {
                 .contains_key(&(library.into(), symbol.into()))
             {
                 return Err("native type already declared as a struct".into());
+            }
+            if self
+                .foreign
+                .callbacks
+                .contains_key(&(library.into(), symbol.into()))
+            {
+                return Err("native type already declared as a callback".into());
             }
             if Scalar::parse(symbol).is_ok() || ["Ptr", "Bytes", "Out"].contains(&symbol) {
                 return Err("handle name conflicts with a built-in native type".into());
@@ -634,8 +704,11 @@ impl Vm {
             );
         }
         let ret = NativeType::parse(ret, library, &self.foreign)?;
-        if matches!(ret, NativeType::Out(_) | NativeType::Bytes) {
-            return Err("Out and Bytes are argument types only".into());
+        if matches!(
+            ret,
+            NativeType::Out(_) | NativeType::Bytes | NativeType::Callback(_)
+        ) {
+            return Err("Out, Bytes and callback types are argument types only".into());
         }
         if let Some(index) = owner {
             if !matches!(args.get(index), Some(NativeType::Handle(_))) {
@@ -671,8 +744,20 @@ impl Vm {
 
 impl Bound {
     fn call(&self, vm: &mut Vm, args: &[Value]) -> NativeResult {
+        let framed = !vm.foreign.callbacks.is_empty()
+            || !vm.foreign.callback_instances.is_empty()
+            || !vm.foreign.frames.is_empty();
+        if framed {
+            vm.foreign
+                .frames
+                .push(callback::Frame::new(args, &self.args));
+        }
         let result = self.invoke(vm, args);
+        let error = if framed { callback::finish(vm) } else { None };
         vm.foreign.drain();
+        if let Some(error) = error {
+            return Err(error);
+        }
         result.map_err(|message| vm.err(format!("{}: {message}", self.name)))
     }
 
@@ -705,10 +790,14 @@ impl Bound {
                 _ => Err("@:owner argument must be an open handle".to_string()),
             })
             .transpose()?;
-        let mut scratch = self
-            .scratch
-            .try_borrow_mut()
-            .map_err(|_| "reentrant native calls are not available yet")?;
+        let mut cached = self.scratch.try_borrow_mut().ok();
+        let mut nested;
+        let scratch = if let Some(cached) = cached.as_mut() {
+            &mut **cached
+        } else {
+            nested = Arguments::new(self.args.len());
+            &mut nested
+        };
         let result = (|| {
             for (index, (ty, value)) in self.args.iter().zip(args).enumerate() {
                 if matches!(ty, NativeType::Out(_))
@@ -719,7 +808,18 @@ impl Bound {
                         index + 1
                     ));
                 }
-                self.encode(ty, *value, &mut scratch, index)
+                if matches!(ty, NativeType::Out(_))
+                    && vm
+                        .foreign
+                        .frames
+                        .iter()
+                        .rev()
+                        .skip(1)
+                        .any(|f| f.outputs.iter().any(|out| out.as_obj() == value.as_obj()))
+                {
+                    return Err("an Out slot is already in use by an active native call".into());
+                }
+                self.encode(ty, *value, scratch, index)
                     .map_err(|e| format!("argument {}: {e}", index + 1))?;
             }
             let base = scratch.slots.as_mut_ptr();
@@ -733,6 +833,7 @@ impl Bound {
             }
             let mut result = Slot { u64_: 0 };
             // Registered declarations guarantee C layouts, symbol ABI and the bounds of pointer arguments.
+            let context = callback::Context::enter(vm);
             unsafe {
                 libffi::raw::ffi_call(
                     self.cif.as_raw_ptr(),
@@ -741,6 +842,7 @@ impl Bound {
                     scratch.pointers.as_mut_ptr(),
                 );
             }
+            drop(context);
             let mut result = unsafe { self.decode(&self.ret, result, vm, owner.as_ref(), true) };
             // Decode every output, including when a different output has an invalid string result.
             for (ty, value) in self.args.iter().zip(args) {
@@ -787,6 +889,7 @@ impl Bound {
                 _ => return Err("expected Bytes".into()),
             },
             NativeType::Struct(ty) => structure::struct_pointer(value, ty)?,
+            NativeType::Callback(ty) => callback::pointer(value, ty)?,
             NativeType::Handle(ty) => match foreign(value) {
                 Some(Foreign::Handle(r)) if Rc::ptr_eq(ty, &r.ty) => {
                     if r.ptr.get().is_null() {
@@ -855,6 +958,15 @@ impl Bound {
                 if ptr.is_null() {
                     return Ok(Value::Nil);
                 }
+                if vm
+                    .foreign
+                    .releases
+                    .borrow()
+                    .iter()
+                    .any(|release| release.ptr == ptr && Rc::ptr_eq(&release.ty, ty))
+                {
+                    return Err("native returned a handle closed during the active call".into());
+                }
                 let existing = ty
                     .live
                     .borrow()
@@ -886,6 +998,9 @@ impl Bound {
                     ty.live
                         .borrow_mut()
                         .insert(ptr as usize, Rc::downgrade(&resource));
+                    if owner.is_some_and(|(_, parent)| parent.ptr.get().is_null()) {
+                        resource.close();
+                    }
                     resource
                 };
                 Foreign::Handle(resource)

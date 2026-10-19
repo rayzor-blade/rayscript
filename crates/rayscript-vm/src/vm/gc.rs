@@ -1,5 +1,5 @@
 //! Collection: mark from every root the VM knows, then sweep. A collection happens only at a poll of a
-//! running fiber, or when the host asks, so no native function is ever midway through holding a value.
+//! running fiber, or when the host asks. Native call frames trace values retained across callbacks.
 
 use super::Vm;
 use crate::object::{Kind, drop_object, trace_children};
@@ -42,6 +42,7 @@ impl Vm {
             roots.push(Value::Obj(*p));
         }
         self.view.trace(&mut |v| roots.push(v));
+        self.foreign.trace(&mut |v| roots.push(v));
         for v in roots {
             mark(&mut self.heap, &mut gray, v);
         }

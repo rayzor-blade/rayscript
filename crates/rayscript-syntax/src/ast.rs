@@ -34,6 +34,7 @@ pub struct NativeBlock {
     pub functions: Vec<NativeFn>,
     pub handles: Vec<NativeHandle>,
     pub structs: Vec<NativeStruct>,
+    pub callbacks: Vec<NativeFn>,
     pub span: Span,
 }
 

@@ -34,6 +34,12 @@ pub fn dump_item(item: &Item) -> String {
                 for field in &st.fields { write!(s, " ({} {})", field.name.name, ty(&field.ty)).unwrap(); }
                 s.push(')');
             }
+            for c in &n.callbacks {
+                write!(s, " (callback {} ({})", c.name.name, params(&c.params)).unwrap();
+                if let Some(r) = &c.ret { write!(s, " {}", ty(r)).unwrap(); }
+                for m in &c.meta { write!(s, " @{}", m.name).unwrap(); }
+                s.push(')');
+            }
             for f in &n.functions {
                 write!(s, " (fn {} ({})", f.name.name, params(&f.params)).unwrap();
                 if let Some(r) = &f.ret {

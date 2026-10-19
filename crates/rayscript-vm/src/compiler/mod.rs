@@ -438,6 +438,46 @@ impl Compiler {
             self.emit(Op::DefGlobal { src: t, name });
             self.free_to(m);
         }
+        for c in &n.callbacks {
+            self.at(c.span);
+            if !names.insert(&c.name.name) { self.error(c.span, "duplicate native type name"); }
+            for p in &c.params {
+                if p.ty.is_none() || p.optional || p.rest || p.default.is_some() {
+                    self.error(p.span, "callback arguments need explicit types without defaults, optional or variadic parameters");
+                }
+            }
+            let failure = match c.meta.as_slice() {
+                [] if ty(&c.ret) == "Void" => Some("null".to_string()),
+                [m] if m.name == ":failure" => match m.args.as_slice() {
+                    [e] => match &e.kind {
+                        ast::ExprKind::Int(n) => Some(n.to_string()),
+                        ast::ExprKind::Float(n) => Some(format!("{n:?}")),
+                        ast::ExprKind::Bool(b) => Some(b.to_string()),
+                        ast::ExprKind::Null => Some("null".to_string()),
+                        ast::ExprKind::Unary { op: ast::UnOp::Neg, expr } => match expr.kind {
+                            ast::ExprKind::Int(n) => n.checked_neg().map(|n| n.to_string()),
+                            ast::ExprKind::Float(n) => Some(format!("{:?}", -n)),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(failure) = failure else {
+                self.error(c.span, "a callback needs one @:failure(literal) annotation; Void callbacks may omit it");
+                continue;
+            };
+            let signature = format!("{}->{}", c.params.iter().map(|p| ty(&p.ty)).collect::<Vec<_>>().join(","), ty(&c.ret));
+            let k = self.const_str(&format!("{}\0{}\0callback\0{}\t{}", n.library, c.name.name, signature, failure));
+            let m = self.mark();
+            let t = self.alloc();
+            self.emit(Op::BindNative { dst: t, spec: k });
+            let name = self.const_str(&c.name.name);
+            self.emit(Op::DefGlobal { src: t, name });
+            self.free_to(m);
+        }
         let structs = n.structs.iter().map(|st| {
             std::iter::once(st.name.name.clone()).chain(st.fields.iter().map(|f| format!("{}:{}", f.name.name, rayscript_syntax::dump::ty(&f.ty)))).collect::<Vec<_>>().join("\t")
         }).collect::<Vec<_>>().join("\n");
@@ -450,6 +490,14 @@ impl Compiler {
             self.emit(Op::BindNative { dst: t, spec: k });
             let name = self.const_str(&st.name.name);
             self.emit(Op::DefGlobal { src: t, name });
+            self.free_to(m);
+        }
+        for c in &n.callbacks {
+            self.at(c.span);
+            let k = self.const_str(&format!("{}\0{}\0callback-check\0", n.library, c.name.name));
+            let m = self.mark();
+            let t = self.alloc();
+            self.emit(Op::BindNative { dst: t, spec: k });
             self.free_to(m);
         }
         for f in &n.functions {

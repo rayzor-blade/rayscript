@@ -1143,3 +1143,598 @@ fn compatible_struct_declarations_are_shared_across_native_blocks() {
         assert!(error.contains("different definition"), "{error}");
     });
 }
+
+const CALLBACKS: &str = r#"
+native "fixture" {
+    @:failure(-7) callback Visit(value:Int32, data:Ptr):Int32;
+    function visit(callback:Visit, data:Ptr, count:Int32):Int32;
+    function callback_result(index:SizeT):Int32;
+}
+"#;
+
+#[test]
+fn callbacks_round_trip_every_scalar_width() {
+    with_vm(|vm| {
+        for (symbol, ty, failure, values) in [
+            (
+                "callback_i8",
+                "Int8",
+                "-1",
+                vec![Value::Int(-128), Value::Int(127)],
+            ),
+            (
+                "callback_i16",
+                "Int16",
+                "-1",
+                vec![Value::Int(-32768), Value::Int(32767)],
+            ),
+            (
+                "callback_i32",
+                "Int32",
+                "-1",
+                vec![Value::Int(i32::MIN as i64), Value::Int(i32::MAX as i64)],
+            ),
+            (
+                "callback_i64",
+                "Int64",
+                "-1",
+                vec![Value::Int(i64::MIN), Value::Int(i64::MAX)],
+            ),
+            (
+                "callback_u8",
+                "UInt8",
+                "255",
+                vec![Value::Int(0), Value::Int(255)],
+            ),
+            (
+                "callback_u16",
+                "UInt16",
+                "65535",
+                vec![Value::Int(0), Value::Int(65535)],
+            ),
+            (
+                "callback_u32",
+                "UInt32",
+                "4294967295",
+                vec![Value::Int(0), Value::Int(u32::MAX as i64)],
+            ),
+            (
+                "callback_u64",
+                "UInt64",
+                "-1",
+                vec![Value::Int(i64::MIN), Value::Int(-1)],
+            ),
+            (
+                "callback_size",
+                "SizeT",
+                "-1",
+                vec![Value::Int(i64::MIN), Value::Int(-1)],
+            ),
+            (
+                "callback_bool",
+                "Bool",
+                "false",
+                vec![Value::Bool(true), Value::Bool(false)],
+            ),
+            (
+                "callback_float",
+                "Float",
+                "-1.5",
+                vec![Value::Float(-2.5), Value::Float(f32::MAX as f64)],
+            ),
+            (
+                "callback_double",
+                "Double",
+                "-1.5",
+                vec![Value::Float(-2.5), Value::Float(f64::MAX)],
+            ),
+        ] {
+            let function = vm.run_source("callback-scalar.rays", &format!(r#"
+                native "fixture" {{ @:failure({failure}) callback CB_{symbol}(value:{ty}):{ty}; function {symbol}(cb:CB_{symbol}, value:{ty}):{ty}; }}
+                var cb = CB_{symbol}(value -> {{ gc(); return value; }});
+                return value -> {symbol}(cb, value);
+            "#)).unwrap();
+            vm.root(function);
+            for value in values {
+                assert_eq!(
+                    call_text(vm, function, &[value]).unwrap(),
+                    vm.display(value),
+                    "{ty}"
+                );
+            }
+            let error = vm.run_source("callback-failure-width.rays", &format!(r#"
+                native "fixture" {{ @:failure({failure}) callback CB_{symbol}(value:{ty}):{ty}; function {symbol}(cb:CB_{symbol}, value:{ty}):{ty}; function callback_bits():UInt64; }}
+                {symbol}(CB_{symbol}(value -> {{ throw 'failure'; }}), {value});
+            "#, value = if ty == "Bool" { "true" } else { "0" })).unwrap_err();
+            assert!(error.contains("failure"));
+            let bits = bind(vm, "function callback_bits():UInt64;", "callback_bits");
+            let expected = match ty {
+                "Int8" | "UInt8" => 255,
+                "Int16" | "UInt16" => 65535,
+                "Int32" | "UInt32" => u32::MAX as i64,
+                "Bool" => 0,
+                "Float" => (-1.5f32).to_bits() as i64,
+                "Double" => (-1.5f64).to_bits() as i64,
+                _ => -1,
+            };
+            assert_eq!(
+                call_text(vm, bits, &[]).unwrap(),
+                expected.to_string(),
+                "failure ABI: {ty}"
+            );
+        }
+    });
+}
+
+#[test]
+fn callbacks_marshal_mixed_arguments_strings_void_and_pointer_results() {
+    with_vm(|vm| {
+        let result = vm.run_source("mixed-callback.rays", r#"
+            native "fixture" {
+                @:failure(-1.0) callback Mixed(a:Int8,b:UInt16,c:Int64,d:Float,e:Double,text:CString):Double;
+                @:failure(null) callback Text(text:CString):CString;
+                callback Done():Void;
+                @:failure(null) callback Buffer():Ptr;
+                function callback_mixed(cb:Mixed):Double;
+                function callback_strings(cb:Text):CString;
+                function callback_void(cb:Done):Void;
+                function callback_pointer(cb:Buffer):UInt8;
+            }
+            var text = '';
+            var sum = callback_mixed(Mixed((a,b,c,d,e,s) -> { text = s; gc(); return a+b+c+d+e; }));
+            var first = callback_strings(Text(s -> { gc(); return s + '-copy'; }));
+            var done = 0;
+            callback_void(Done(() -> { done += 1; gc(); }));
+            var byte = callback_pointer(Buffer(() -> Bytes([77])));
+            return [sum, text, first, done, byte];
+        "#).unwrap();
+        assert_eq!(vm.display(result), "[64591.75,héllo,first-copy,1,77]");
+    });
+}
+
+#[test]
+fn callback_failures_return_to_c_then_rethrow_the_original_value() {
+    with_vm(|vm| {
+        let result = vm
+            .run_source(
+                "failure-callback.rays",
+                &format!(
+                    r#"{CALLBACKS}
+            var token = {{message:'stop'}};
+            var invoked = 0;
+            var same = false;
+            try {{ visit(Visit((value,data) -> {{ invoked++; throw token; }}), null, 3); }}
+            catch(e) {{ gc(); same = e == token; }}
+            return [same, invoked, callback_result(0), callback_result(1), callback_result(2)];
+        "#
+                ),
+            )
+            .unwrap();
+        assert_eq!(vm.display(result), "[true,1,-7,-7,-7]");
+        let result = vm
+            .run_source(
+                "conversion-callback.rays",
+                &format!(
+                    r#"{CALLBACKS}
+            var message = '';
+            try {{ visit(Visit((value,data) -> 2147483648), null, 1); }} catch(e) {{ message = e; }}
+            return [message, callback_result(3)];
+        "#
+                ),
+            )
+            .unwrap();
+        assert!(vm.display(result).contains("range"));
+        assert!(vm.display(result).ends_with(",-7]"));
+    });
+}
+
+#[test]
+fn callbacks_reenter_the_same_binding_and_catch_nested_failures() {
+    with_vm(|vm| {
+        let result = vm.run_source("recursive-callback.rays", &format!(r#"{CALLBACKS}
+            var depth = 0;
+            var cb = null;
+            cb = Visit((value,data) -> {{
+                if (depth == 3) return 2;
+                depth++;
+                var nested = visit(cb, null, 2);
+                depth--;
+                gc();
+                return nested;
+            }});
+            var sum = visit(cb, null, 2);
+            var caught = false;
+            var outer = Visit((value,data) -> {{
+                try {{ visit(Visit((v,d) -> {{ throw 'nested'; }}), null, 1); }} catch(e) {{ caught = e == 'nested'; }}
+                gc(); return 5;
+            }});
+            return [sum, visit(outer, null, 1), caught];
+        "#)).unwrap();
+        assert_eq!(vm.display(result), "[32,5,true]");
+    });
+}
+
+#[test]
+fn callback_struct_fields_pin_callbacks_data_and_replaced_strings() {
+    with_vm(|vm| {
+        let result = vm
+            .run_source(
+                "options-callback.rays",
+                &format!(
+                    r#"{CALLBACKS}
+            native "fixture" {{
+                struct Options {{ callback:Visit; data:Ptr; label:CString; }}
+                struct Item {{ value:Int32; }}
+                function visit_options(options:Options):Int32;
+            }}
+            var options = alloc(Options);
+            var item = alloc(Item); item.value = 10;
+            options.data = item; item = null;
+            options.label = 'original';
+            options.callback = Visit((value,data) -> {{
+                options.callback = null; options.data = null; options.label = 'changed';
+                gc(); return borrow(Item, data).value + value;
+            }});
+            var copy = alloc(Options); copy = options;
+            var result = visit_options(options);
+            gc();
+            return [result, options.callback, options.data];
+        "#
+                ),
+            )
+            .unwrap();
+        assert_eq!(vm.display(result), "[31,null,null]");
+    });
+}
+
+#[test]
+fn callback_closes_invalidate_immediately_and_free_after_c_returns() {
+    with_vm(|vm| {
+        let result = run_handles(
+            vm,
+            &format!(
+                r#"{CALLBACKS}
+            native "fixture" {{ function visit_session(session:Session, cb:Visit, data:Ptr):Int64; }}
+            var owner = session(6); var child = make_record(owner, 2);
+            var during = -1; var invalid = false;
+            var result = visit_session(owner, Visit((value,data) -> {{
+                owner.close(); gc(); during = freed_count(); invalid = owner == null && child == null;
+                return 0;
+            }}), null);
+            return [result, during, invalid, freed_count(), freed_at(0), freed_at(1)];
+        "#
+            ),
+        );
+        assert_eq!(vm.display(result), "[12,0,true,2,602,6]");
+    });
+}
+
+#[test]
+fn owned_outputs_created_after_a_callback_close_are_released_before_the_owner() {
+    with_vm(|vm| {
+        let result = run_handles(
+            vm,
+            &format!(
+                r#"{CALLBACKS}
+            native "fixture" {{ @:owner(session) function visit_record(out:Out<Record>, session:Session, cb:Visit):Void; }}
+            var owner = session(8); var out = Out(Record);
+            visit_record(out, owner, Visit((value,data) -> {{ owner.close(); gc(); return 0; }}));
+            return [out.value == null, freed_count(), freed_at(0), freed_at(1)];
+        "#
+            ),
+        );
+        assert_eq!(vm.display(result), "[true,2,803,8]");
+    });
+}
+
+#[test]
+fn active_output_slots_cannot_be_reused_by_callbacks_and_still_decode_on_error() {
+    with_vm(|vm| {
+        let result = vm.run_source("callback-out.rays", &format!(r#"{CALLBACKS}
+            native "fixture" {{ function visit_output(out:Out<Int32>, cb:Visit):Void; function two_outputs(a:Out<Int32>, b:Out<Int32>):Void; }}
+            var out = Out(Int32); var message = '';
+            try {{ visit_output(out, Visit((value,data) -> {{ two_outputs(out, Out(Int32)); return 0; }})); }}
+            catch(e) {{ message = e; }}
+            return [out.value, message];
+        "#)).unwrap();
+        assert!(vm.display(result).starts_with("[11,"));
+        assert!(vm.display(result).contains("already in use"));
+    });
+}
+
+#[test]
+fn callback_borrows_expire_after_the_callback_and_handles_are_not_owned() {
+    with_vm(|vm| {
+        let result = run_handles(
+            vm,
+            r#"
+            native "fixture" {
+                struct Pair { x:Int32; y:Double; }
+                @:failure(-1) callback PairVisit(pair:Pair):Int32;
+                @:failure(-1) callback SessionVisit(session:Session):Int64;
+                function callback_pair(cb:PairVisit):Int32;
+                function callback_session(cb:SessionVisit):Int64;
+            }
+            var saved = null; var savedSession = null; var cannotClose = false;
+            var pair = callback_pair(PairVisit(p -> { saved = p; gc(); return p.x; }));
+            var id = callback_session(SessionVisit(s -> { savedSession = s; try { s.close(); } catch(e) { cannotClose = true; } gc(); return session_id(s); }));
+            var expired = false; try { saved.x; } catch(e) { expired = true; }
+            return [pair, id, expired, saved == null, savedSession == null, cannotClose, freed_count()];
+        "#,
+        );
+        assert_eq!(vm.display(result), "[9,19,true,true,true,true,0]");
+    });
+}
+
+#[test]
+fn foreign_thread_callbacks_return_failure_without_entering_the_vm() {
+    with_vm(|vm| {
+        let result = vm.run_source("worker-callback.rays", &format!(r#"{CALLBACKS}
+            native "fixture" {{ function callback_worker(cb:Visit):Int32; }}
+            var invoked = false; var message = '';
+            try {{ callback_worker(Visit((value,data) -> {{ invoked = true; return 5; }})); }} catch(e) {{ message = e; }}
+            return [invoked, message];
+        "#)).unwrap();
+        assert!(vm.display(result).starts_with("[false,"));
+        assert!(vm.display(result).contains("creating thread"));
+    });
+}
+
+#[test]
+fn invalid_callback_declarations_values_and_types_are_rejected() {
+    with_vm(|vm| {
+        for (index, declaration) in [
+            "callback CB(v:Int32):Int32;",
+            "@:failure(256) callback CB(v:UInt8):UInt8;",
+            "@:failure(0) callback CB(v:Void):Int32;",
+            "@:failure(0) callback CB(v:Out<Int32>):Int32;",
+            "@:failure(0) callback CB(v:Missing):Int32;",
+            "@:failure('no') callback CB():Int32;",
+            "@:failure(1) callback CB():Ptr;",
+            "@:failure(0) callback CB(?v:Int32):Int32;",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let declaration = declaration.replace(" CB(", &format!(" CB_{index}("));
+            assert!(
+                vm.run_source(
+                    "bad-callback.rays",
+                    &format!("native \"fixture\" {{ {declaration} }}")
+                )
+                .is_err(),
+                "{declaration}"
+            );
+        }
+        let result = vm
+            .run_source(
+                "bad-callback-values.rays",
+                &format!(
+                    r#"{CALLBACKS}
+            var errors = 0;
+            try {{ Visit(1); }} catch(e) {{ errors++; }}
+            try {{ visit((v,d) -> 0, null, 1); }} catch(e) {{ errors++; }}
+            return [errors, visit(null, null, 2)];
+        "#
+                ),
+            )
+            .unwrap();
+        assert_eq!(vm.display(result), "[2,0]");
+    });
+}
+
+#[test]
+fn callback_constructors_retain_resolved_types_after_registration_replacement() {
+    with_vm(|vm| {
+        let function = vm
+            .run_source(
+                "old-callback.rays",
+                r#"
+            native "fixture" {
+                struct Pair { x:Int32; y:Double; }
+                @:failure(-1) callback PairVisit(pair:Ptr<Pair>):Int32;
+                function callback_pair(cb:PairVisit):Int32;
+            }
+            return () -> callback_pair(PairVisit(pair -> { gc(); return pair.x; }));
+        "#,
+            )
+            .unwrap();
+        vm.root(function);
+        unsafe {
+            vm.register_native_library("fixture", "/missing/replacement-library");
+        }
+        assert_eq!(call_text(vm, function, &[]).unwrap(), "9");
+    });
+}
+
+#[test]
+fn callback_values_trace_closures_and_can_wrap_rust_functions() {
+    with_vm(|vm| {
+        vm.define_native("rust_callback", |vm, _| {
+            vm.collect();
+            Ok(Value::Int(6))
+        });
+        let result = vm
+            .run_source(
+                "native-callback.rays",
+                &format!(
+                    r#"{CALLBACKS}
+            var cb = Visit(rust_callback);
+            return visit(cb, null, 2);
+        "#
+                ),
+            )
+            .unwrap();
+        assert_eq!(vm.display(result), "12");
+        let result = vm.run_source("callback-cycle.rays", &format!(r#"{CALLBACKS}
+            function make() {{ var box = {{value:8, callback:null}}; box.callback = Visit((value,data) -> box.value); return box.callback; }}
+            var cb = make(); gc();
+            var result = visit(cb, null, 1); cb = null; gc();
+            return result;
+        "#)).unwrap();
+        assert_eq!(vm.display(result), "8");
+    });
+}
+
+#[test]
+fn callback_borrowed_managed_handles_share_close_invalidation() {
+    with_vm(|vm| {
+        let result = run_handles(
+            vm,
+            r#"
+            native "fixture" {
+                @:failure(-1) callback SessionVisit(session:Session):Int64;
+                function callback_owned_session(session:Session, cb:SessionVisit):Int64;
+            }
+            var owner = session(12); var invalid = false;
+            var result = callback_owned_session(owner, SessionVisit(borrowed -> {
+                owner.close(); gc(); invalid = borrowed == null;
+                try { session_id(borrowed); } catch(e) { return 2; }
+                return 0;
+            }));
+            return [result, invalid, freed_count()];
+        "#,
+        );
+        assert_eq!(vm.display(result), "[14,true,1]");
+    });
+}
+
+#[test]
+fn closed_handles_cannot_be_reacquired_from_c_before_the_deferred_free() {
+    with_vm(|vm| {
+        let result = run_handles(
+            vm,
+            &format!(
+                r#"{CALLBACKS}
+            native "fixture" {{ function callback_closed_alias(session:Session, cb:Visit):Session; }}
+            var owner = session(13); var message = '';
+            try {{ callback_closed_alias(owner, Visit((v,d) -> {{ owner.close(); return 0; }})); }} catch(e) {{ message = e; }}
+            return [message, freed_count()];
+        "#
+            ),
+        );
+        assert!(
+            vm.display(result)
+                .contains("handle closed during the active call")
+        );
+        assert!(vm.display(result).ends_with(",1]"));
+    });
+}
+
+#[test]
+fn closed_struct_storage_does_not_require_refresh_after_c_returns() {
+    with_vm(|vm| {
+        let result = vm.run_source("callback-close-view.rays", &format!(r#"{HANDLES}
+{STRUCTS}
+{BOXES}
+{CALLBACKS}
+            native "fixture" {{ function callback_owned_pair(pair:Pair, cb:Visit):Int32; }}
+            var owner = open_box(17); var pair = box_pair(owner);
+            var value = callback_owned_pair(pair, Visit((v,d) -> {{ owner.close(); gc(); return 0; }}));
+            return [value, pair == null, freed_count()];
+        "#)).unwrap();
+        assert_eq!(vm.display(result), "[17,true,1]");
+    });
+}
+
+#[test]
+fn scalar_calls_still_allocate_nothing_with_registered_callbacks() {
+    with_vm(|vm| {
+        let callback = vm
+            .run_source(
+                "unused-callback.rays",
+                &format!("{CALLBACKS} return Visit((v,d) -> v);"),
+            )
+            .unwrap();
+        vm.root(callback);
+        let f = bind(vm, "function add(a:Int, b:Int):Int;", "add");
+        let args = [Value::Int(1), Value::Int(2)];
+        ALLOCATIONS.with(|n| n.set(0));
+        COUNT_ALLOCATIONS.with(|on| on.set(true));
+        for _ in 0..1000 {
+            assert!(matches!(vm.call(f, &args), Ok(Value::Int(3))));
+        }
+        COUNT_ALLOCATIONS.with(|on| on.set(false));
+        assert_eq!(ALLOCATIONS.with(Cell::get), 0);
+    });
+}
+
+#[test]
+fn registered_callbacks_pin_byte_userdata_when_script_releases_its_references() {
+    with_vm(|vm| {
+        let result = vm.run_source("registered-callback.rays", &format!(r#"{CALLBACKS}
+            native "fixture" {{
+                function register_visit(cb:Visit, data:Ptr):Void;
+                function run_registered_visit():Int32;
+                function unregister_visit():Void;
+            }}
+            var bytes = Bytes([65]); var callback = null;
+            callback = Visit((value,data) -> {{ bytes = null; callback = null; gc(); return Bytes(data, 1)[0]; }});
+            register_visit(callback, bytes);
+            var result = run_registered_visit();
+            unregister_visit(); gc();
+            return result;
+        "#)).unwrap();
+        assert_eq!(vm.display(result), "130");
+    });
+}
+
+#[test]
+fn returned_byte_pointers_retain_storage_and_check_borrow_bounds() {
+    with_vm(|vm| {
+        let ptr = vm
+            .run_source(
+                "byte-alias.rays",
+                r#"
+            native "fixture" { function identity_ptr(p:Ptr):Ptr; }
+            return identity_ptr(Bytes([65,66,67]));
+        "#,
+            )
+            .unwrap();
+        vm.root(ptr);
+        vm.collect();
+        vm.define_global("byte_alias", ptr);
+        let result = vm
+            .run_source(
+                "read-byte-alias.rays",
+                r#"
+            native "fixture" { struct Word { value:Int64; } }
+            var rejected = false; try { borrow(Word, byte_alias); } catch(e) { rejected = true; }
+            return [Bytes(byte_alias, 3).toString(), rejected];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(vm.display(result), "[ABC,true]");
+    });
+}
+
+#[test]
+fn byte_backed_structs_trace_callback_fields_and_share_retainers_across_views() {
+    with_vm(|vm| {
+        let result = vm
+            .run_source(
+                "byte-callback-fields.rays",
+                &format!(
+                    r#"{CALLBACKS}
+            native "fixture" {{
+                struct Options {{ callback:Visit; data:Ptr; label:CString; }}
+                function visit_options(options:Options):Int32;
+                function identity_ptr(p:Ptr):Ptr;
+            }}
+            function make() {{
+                var bytes = Bytes(Options.size);
+                var view = borrow(Options, identity_ptr(bytes));
+                view.callback = Visit((value,data) -> Bytes(data, 1)[0] + value);
+                view.data = Bytes([10]); view.label = 'bytes';
+                return bytes;
+            }}
+            var bytes = make(); gc();
+            var view = borrow(Options, bytes);
+            return [visit_options(view), view.callback != null, view.label];
+        "#
+                ),
+            )
+            .unwrap();
+        assert_eq!(vm.display(result), "[28,true,bytes]");
+    });
+}

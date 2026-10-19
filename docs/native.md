@@ -44,6 +44,7 @@ Registration is unsafe: loading a library executes its initialization code, and 
 | `Ptr` | `void *` | Opaque pointer, handle, `Bytes` or null argument; opaque pointer or null result. |
 | `Out<T>` | `T *` | Typed output slot constructed with `Out(T)`; arguments only. |
 | Declared handle | Opaque pointer | Matching handle or null. |
+| Declared callback | C function pointer | Matching callback object or null; arguments and struct fields only. |
 | `Bytes` | `unsigned char *` | Fixed-size buffer; arguments only. |
 | Declared struct, `Ptr<Struct>` | `struct T *` | Struct view, struct array or null; structs are never passed by value. |
 
@@ -83,9 +84,9 @@ Native blocks declare handles before binding their functions, regardless of sour
 
 `@:owner(parameter)` retains the named handle for returned handles, pointers and struct views, including output slots. Owner arguments must be open handles. Child handles trace their owners through the collector and retain their native resources independently of heap sweep order. An owner can outlive its last direct script reference while a child remains reachable.
 
-`handle.close()` immediately frees child handles before the handle, invalidates all its aliases and borrowed pointers, and can be called repeatedly. Calling the declared free function has the same effect. Closed handles compare equal to null and are false in conditions; passing one to a native function raises an error. Repeated returns of the same live address and handle type share ownership; conflicting owner declarations raise an error.
+`handle.close()` immediately invalidates all its aliases and borrowed pointers, and can be called repeatedly. It frees child handles before the handle. When called during a native callback, the frees wait until the outermost C call returns. Calling the declared free function has the same effect. Closed handles compare equal to null and are false in conditions; passing one to a native function raises an error. Repeated returns of the same live address and handle type share ownership; conflicting owner declarations raise an error.
 
-Unreachable handles queue their frees during collection. The VM drains that queue after the heap sweep, on the VM thread. A queued child retains its owner until its free function finishes. VM teardown uses the same order. Destructors must not call back into the VM; callbacks are a later stage.
+Unreachable handles queue their frees during collection. The VM drains that queue after the heap sweep, on the VM thread. A queued child retains its owner until its free function finishes. VM teardown uses the same order. Destructors must not call back into the VM. During an active C call, collection queues frees until C has returned.
 
 ## Byte buffers
 
@@ -133,11 +134,36 @@ In a function signature, `Pair` and `Ptr<Pair>` both mean a pointer. In a field 
 
 `borrow(Type, pointer[, count])` creates a view without copying. The pointer must be aligned; known VM storage bounds are checked. Native pointer bounds remain part of the registered library's memory contract. A count creates an indexed array view. Native struct results and `Out<Struct>.value` are borrowed views; `@:owner(handle)` links them to a C allocation's lifetime. Closing that owner invalidates the views and their borrowed fields. Structs themselves have no `close()` method.
 
-Returned pointers into known VM struct storage share its allocation and field retainers. The VM also captures managed struct pointers and handles that C writes into VM-owned pointer fields before collection. Native code must not retain VM storage after a call unless the script keeps it alive for that use.
+Returned pointers into known VM storage retain the struct allocation or byte buffer and its field retainers. The VM also captures managed struct pointers and handles that C writes into VM-owned pointer fields before collection. Native code must not retain VM storage after a call unless the script keeps it alive for that use.
 
 Assigning a `CString` field copies NUL-terminated UTF-8 storage. Assigned pointers and handles are traced while their field still refers to them. Reading a handle field borrows its lifetime; a pointer already managed by the VM shares that existing resource. Borrowed handles cannot be freed with `close()`. Calls reject struct fields referring to closed managed handles; fields in live storage can be cleared or replaced.
 
 Non-null pointer-bearing fields in C-owned storage are read-only, including `CString` and pointer-bearing embedded struct copies. Such writes could leave C referring to storage whose VM view has been collected. Scalar writes and clearing pointers to null are supported; use `alloc(Type)` for fully writable structs. Views backed by VM byte buffers are writable and retain the buffer.
+
+## Callbacks
+
+```haxe
+native "fixture" {
+  @:failure(-1) callback Visit(value:Int32, data:Ptr):Int32;
+  struct Options { callback:Visit; data:Ptr; label:CString; }
+  function visit(callback:Visit, data:Ptr, count:Int32):Int32;
+}
+var total = 0;
+var callback = Visit((value, data) -> { total += value; return 0; });
+visit(callback, null, 3);
+```
+
+`Visit(function)` allocates a C function pointer backed by a script closure or embedding native function. A declared callback can be a function argument or struct field. Types are checked by declaration identity; null supplies a null function pointer. Reading a field assigned by script returns its callback object. Unmanaged C function pointers cannot be invoked or wrapped as script callbacks.
+
+Callback arguments support scalars, `CString`, `Ptr`, declared structs (including `Ptr<Struct>`) and borrowed handles. Results support scalars, `CString`, `Ptr` and `Void`. `Out`, `Bytes`, callback parameters and owned handle results are unsupported callback signatures; use `Ptr` for C buffer arguments. Strings received from C are copied. Structs, handles and raw pointers received by a callback are borrowed for that callback invocation; their views expire when it returns. Copy any data needed later. Borrowed handles cannot be closed. Bounds and ownership of native memory remain part of the trusted C declaration's contract.
+
+Non-void callbacks require one `@:failure(literal)` annotation, checked against the result type. Signed integer and floating-point literals and booleans are accepted; pointer and `CString` results require null. Void callbacks may omit the annotation or use `@:failure(null)`. If the callback throws or its result cannot be converted, C receives this failure value. Remaining callbacks in that C call also return the failure value without invoking script. After C returns and output slots have been decoded, the original thrown value is rethrown. Nested native calls have their own error scope, so script may catch an inner call's error and continue the outer callback.
+
+Callbacks can call native functions recursively, including the binding that invoked them. Active output slots cannot be reused by nested calls. A callback runs synchronously on its creating VM thread and cannot suspend. Calls from other threads return the failure value without entering the VM and cause an error when the active C call returns. Worker-thread marshaling is not implemented yet.
+
+Active calls retain their argument graph, callback arguments and pointer results, including replaced struct strings and callback fields, through the return from C. A callback may run GC or close an owned handle: closure storage and passed buffers remain allocated, and actual handle frees wait until the outermost call returns. Closed handles become invalid to script immediately. Callback string results remain NUL-terminated and valid until the enclosing C call returns.
+
+If C retains a callback or VM pointer beyond the call, the script must keep the callback and its data reachable for the entire registration, and unregister it before releasing them. Native code must stop invoking a callback before its VM is destroyed. Calls outside an active native call are unsupported. A stored function pointer does not itself root script values.
 
 ## Checking
 
@@ -147,8 +173,8 @@ cargo run -p rayscript-vm --example native
 cargo test --release -p rayscript-vm --test native scalar_call_overhead -- --ignored --nocapture
 ```
 
-The `rayscript-ffi-fixture` workspace crate builds a Rust C-ABI shared library before the VM's native-call tests. It covers integer widths, booleans, floating-point values, mixed signatures, strings, nulls, void results, typed outputs, buffers, owned handles, C layouts, nested structs, arrays and borrowed views. Tests also cover registration and symbol failures, argument errors, library lifetime, owner tracing, child-before-parent frees, use after close, aliases and allocations during repeated scalar calls. The ignored release benchmark compares a scalar call with a Rust closure native; measurements belong in the tracker.
+The `rayscript-ffi-fixture` workspace crate builds a Rust C-ABI shared library before the VM's native-call tests. It covers integer widths, booleans, floating-point values, mixed signatures, strings, nulls, void results, typed outputs, buffers, owned handles, C layouts, nested structs, arrays, borrowed views and callbacks. Tests also cover registration and symbol failures, argument errors, library lifetime, owner tracing, child-before-parent frees, use after close, aliases and allocations during repeated scalar calls. The ignored release benchmark compares a scalar call with a Rust closure native; measurements belong in the tracker.
 
 ## Limits
 
-Callbacks and worker lanes are not implemented. Function annotations other than `@:owner`, including `@:blocking`, are rejected rather than silently ignored. The initial target is macOS arm64; other targets require their own ABI tests. Structs by value, unions and variadic calls are outside v1.
+Worker lanes are not implemented. Function annotations other than `@:owner`, including `@:blocking`, are rejected rather than silently ignored. The initial target is macOS arm64; other targets require their own ABI tests. Structs by value, unions and variadic calls are outside v1.

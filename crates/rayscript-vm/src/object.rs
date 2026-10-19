@@ -87,6 +87,7 @@ pub struct StringObj {
 #[repr(C)]
 pub struct BytesObj {
     pub header: Header,
+    pub(crate) native_backing: std::cell::RefCell<Option<std::rc::Rc<crate::vm::ffi::structure::Backing>>>,
     pub data: Box<[std::cell::UnsafeCell<u8>]>,
 }
 
@@ -268,7 +269,8 @@ impl Obj {
 /// Calls `f` with each value an object refers to, for the collector to mark.
 pub fn trace_children(obj: Obj, f: &mut dyn FnMut(Value)) {
     match obj.kind() {
-        Kind::String | Kind::Range | Kind::Bytes => {}
+        Kind::String | Kind::Range => {}
+        Kind::Bytes => crate::vm::ffi::trace_bytes(obj, f),
         Kind::Host => {
             for value in &obj.host_ref().references { f(*value); }
             crate::vm::ffi::trace_host(obj, f);

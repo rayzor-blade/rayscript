@@ -30,6 +30,7 @@ enum FieldType {
     Scalar(Scalar),
     Ptr,
     Handle(Rc<HandleType>),
+    Callback(Rc<callback::CallbackType>),
     Inline(Target),
     Pointer(Target),
 }
@@ -76,6 +77,13 @@ pub(super) fn bind(vm: &mut Vm, library: &str, symbol: &str, spec: &str) -> Resu
         if name.is_empty() || Scalar::parse(name).is_ok() || ["Ptr", "Bytes", "Out"].contains(&name)
         {
             return Err(format!("invalid struct name `{name}`"));
+        }
+        if vm
+            .foreign
+            .callbacks
+            .contains_key(&(library.into(), name.into()))
+        {
+            return Err(format!("duplicate native type `{name}`"));
         }
         if !all_names.insert(name)
             || vm
@@ -141,6 +149,8 @@ pub(super) fn bind(vm: &mut Vm, library: &str, symbol: &str, spec: &str) -> Resu
                 FieldType::Inline(target)
             } else if ty == "Ptr" {
                 FieldType::Ptr
+            } else if let Some(callback) = vm.foreign.callbacks.get(&(library.into(), ty.into())) {
+                FieldType::Callback(callback.clone())
             } else if let Some(handle) = vm.foreign.types.get(&(library.into(), ty.into())) {
                 FieldType::Handle(handle.clone())
             } else {
@@ -267,8 +277,9 @@ struct Retained {
     value: Value,
 }
 
-pub(super) struct Backing {
+pub(crate) struct Backing {
     allocation: Option<Allocation>,
+    expired: Option<Rc<Cell<bool>>>,
     owner: Option<Value>,
     guard: Option<Rc<Resource>>,
     strings: RefCell<HashMap<usize, Rc<CString>>>,
@@ -284,6 +295,7 @@ impl Backing {
     ) -> Rc<Self> {
         Rc::new(Self {
             allocation,
+            expired: None,
             owner,
             guard,
             strings: RefCell::new(HashMap::new()),
@@ -292,6 +304,9 @@ impl Backing {
         })
     }
     fn storage_closed(&self, seen: &mut HashSet<usize>) -> bool {
+        if self.expired.as_ref().is_some_and(|s| s.get()) {
+            return true;
+        }
         if self.guard.as_ref().is_some_and(|r| r.ptr.get().is_null()) {
             return true;
         }
@@ -315,6 +330,9 @@ impl Backing {
         }
     }
     fn closed(&self, seen: &mut HashSet<usize>) -> bool {
+        if self.expired.as_ref().is_some_and(|s| s.get()) {
+            return true;
+        }
         if self.guard.as_ref().is_some_and(|r| r.ptr.get().is_null()) {
             return true;
         }
@@ -515,6 +533,7 @@ pub(super) fn install(vm: &mut Vm) {
                 .checked_mul(count)
                 .filter(|n| *n <= isize::MAX as usize)
                 .ok_or("struct view size overflows")?;
+            known(vm, ptr, size)?;
             let guard = match foreign(args[1]) {
                 Some(Foreign::Struct(v)) => v.guard.clone(),
                 Some(Foreign::Pointer { owner: Some(r), .. }) => Some((args[1], r.clone())),
@@ -546,8 +565,15 @@ pub(super) fn install(vm: &mut Vm) {
                         if size > obj.bytes().len() {
                             return Err("struct view exceeds Bytes source buffer".into());
                         }
+                        obj.bytes()
+                            .native_backing
+                            .borrow()
+                            .as_ref()
+                            .unwrap()
+                            .clone()
+                    } else {
+                        Backing::new(None, Some(args[1]), None)
                     }
-                    Backing::new(None, Some(args[1]), None)
                 }
             };
             if let Some(allocation) = &backing.allocation {
@@ -704,6 +730,11 @@ fn read_field(vm: &mut Vm, view: &View, field: &Field, address: *mut u8) -> Resu
             }
             let retained = cached(view, address, ptr);
             let foreign = match ty {
+                FieldType::Callback(_) => {
+                    return retained.ok_or_else(|| {
+                        "callback field contains an unmanaged C function pointer".into()
+                    });
+                }
                 FieldType::Handle(ty) => {
                     if let Some(value) = retained {
                         return Ok(value);
@@ -827,6 +858,7 @@ pub(super) fn set_field(
             ty => {
                 let ptr = match ty {
                     FieldType::Ptr => pointer(value)?,
+                    FieldType::Callback(ty) => callback::pointer(value, ty)?,
                     FieldType::Handle(ty) => handle_pointer(value, ty)?,
                     FieldType::Pointer(target) => struct_pointer(value, &view.ty.target(target))?,
                     _ => unreachable!(),
@@ -1102,6 +1134,9 @@ pub(super) fn refresh(vm: &mut Vm, args: &[Value], result: Option<Value>) -> Res
         value: Value,
         seen: &mut HashSet<(usize, usize, usize)>,
     ) -> Result<(), String> {
+        if storage_closed_value(value, &mut HashSet::new()) {
+            return Ok(());
+        }
         let view = match foreign(value) {
             Some(Foreign::Out { .. }) => {
                 for child in value.as_obj().unwrap().host_ref().references.clone() {
@@ -1226,4 +1261,125 @@ pub(super) fn refresh(vm: &mut Vm, args: &[Value], result: Option<Value>) -> Res
         visit(vm, value, &mut seen)?;
     }
     Ok(())
+}
+
+pub(super) fn pin_strings(value: Value, strings: &mut Vec<Rc<CString>>) {
+    let backing = match foreign(value) {
+        Some(Foreign::Struct(v)) => Some(v.backing.clone()),
+        Some(Foreign::BorrowedHandle { backing, .. }) => Some(backing.clone()),
+        Some(Foreign::Pointer {
+            structure: Some(backing),
+            ..
+        }) => Some(backing.clone()),
+        _ => value
+            .as_obj()
+            .filter(|o| o.kind() == Kind::Bytes)
+            .and_then(|o| o.bytes().native_backing.borrow().clone()),
+    };
+    if let Some(backing) = backing {
+        strings.extend(backing.strings.borrow().values().cloned());
+    }
+}
+
+pub(super) fn callback_argument(
+    vm: &mut Vm,
+    ty: &NativeType,
+    ptr: *mut c_void,
+    library: &Rc<Library>,
+    expired: Rc<Cell<bool>>,
+) -> Result<Value, String> {
+    if ptr.is_null() {
+        return Ok(Value::Nil);
+    }
+    let known = known(vm, ptr.cast(), 0)?;
+    let keeper = known.map(|backing| {
+        vm.new_host(
+            0,
+            Box::new(Foreign::Pointer {
+                ptr,
+                owner: None,
+                structure: Some(backing),
+                _library: library.clone(),
+            }),
+        )
+    });
+    let resource = match ty {
+        NativeType::Handle(ty) => ty
+            .live
+            .borrow()
+            .get(&(ptr as usize))
+            .and_then(Weak::upgrade),
+        _ => None,
+    };
+    let keeper = keeper.or_else(|| {
+        resource
+            .as_ref()
+            .map(|r| vm.new_host(0, Box::new(Foreign::Handle(r.clone()))))
+    });
+    let backing = Rc::new(Backing {
+        allocation: None,
+        expired: Some(expired),
+        owner: keeper,
+        guard: resource,
+        strings: RefCell::new(HashMap::new()),
+        references: RefCell::new(HashMap::new()),
+        copies: RefCell::new(HashMap::new()),
+    });
+    let data = match ty {
+        NativeType::Struct(ty) => {
+            check_alignment(ty, ptr.cast())?;
+            known_range(vm, ptr, ty.record().layout.size())?;
+            Foreign::Struct(View {
+                ty: ty.clone(),
+                ptr: ptr.cast(),
+                backing,
+                count: 1,
+                array: false,
+                guard: None,
+                indirect: false,
+            })
+        }
+        NativeType::Handle(ty) => Foreign::BorrowedHandle {
+            ty: ty.clone(),
+            ptr,
+            backing,
+            guard: None,
+        },
+        NativeType::Ptr => Foreign::Pointer {
+            ptr,
+            owner: None,
+            structure: Some(backing),
+            _library: library.clone(),
+        },
+        _ => return Err("unsupported callback argument".into()),
+    };
+    Ok(vm.new_host(0, Box::new(data)))
+}
+
+fn known_range(vm: &mut Vm, ptr: *mut c_void, size: usize) -> Result<(), String> {
+    known(vm, ptr.cast(), size).map(|_| ())
+}
+
+pub(super) fn register_bytes(vm: &mut Vm, value: Value) {
+    let Some(obj) = value.as_obj() else {
+        return;
+    };
+    let backing = Backing::new(None, Some(value), None);
+    register(vm, &backing);
+    *obj.bytes().native_backing.borrow_mut() = Some(backing);
+}
+
+pub(super) fn pin_cstring(vm: &Vm, ptr: *const c_char, strings: &mut Vec<Rc<CString>>) {
+    if ptr.is_null() {
+        return;
+    }
+    let address = ptr as usize;
+    for backing in vm.foreign.struct_backings.iter().filter_map(Weak::upgrade) {
+        for text in backing.strings.borrow().values() {
+            let base = text.as_ptr() as usize;
+            if address >= base && address - base < text.as_bytes_with_nul().len() {
+                strings.push(text.clone());
+            }
+        }
+    }
 }
