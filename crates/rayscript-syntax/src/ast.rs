@@ -26,13 +26,21 @@ pub struct Import {
     pub span: Span,
 }
 
-/// `native "library" { function name(a:Int, b:String):Int; ... }`: functions of a native library.
+/// Function and type declarations belonging to a native library.
 #[derive(Clone, Debug)]
 pub struct NativeBlock {
     pub library: String,
     pub library_span: Span,
     pub functions: Vec<NativeFn>,
     pub handles: Vec<NativeHandle>,
+    pub structs: Vec<NativeStruct>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeStruct {
+    pub name: Ident,
+    pub fields: Vec<TypeField>,
     pub span: Span,
 }
 

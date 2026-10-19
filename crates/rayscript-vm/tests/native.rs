@@ -716,3 +716,430 @@ fn an_output_decode_error_still_wraps_other_owned_outputs() {
         assert_eq!(vm.display(value), "[true,null,15,1]");
     });
 }
+
+const STRUCTS: &str = r#"
+native "fixture" {
+    struct Nested { tag:UInt8; pair:Pair; tail:UInt16; }
+    struct Pair { x:Int32; y:Double; }
+    struct Node { value:Int64; next:Ptr<Node>; name:CString; }
+    struct Fields {
+        i8_:Int8; u8_:UInt8; i16_:Int16; u16_:UInt16;
+        i32_:Int32; u32_:UInt32; i64_:Int64; u64_:UInt64;
+        size:SizeT; flag:Bool; float:Float; double:Double;
+        text:CString; data:Ptr;
+    }
+    function pair_size():SizeT;
+    function pair_align():SizeT;
+    function nested_size():SizeT;
+    function nested_align():SizeT;
+    function fields_size():SizeT;
+    function fields_align():SizeT;
+    function pair_value(pair:Pair):Double;
+    function fill_pair(pair:Pair, x:Int32, y:Double):Void;
+    function fill_nested(n:Nested):Void;
+    function nested_value(n:Nested):Double;
+    function fill_pairs(pairs:Pair, count:SizeT):Void;
+    function pairs_value(pairs:Pair, count:SizeT):Double;
+    function fill_fields(fields:Fields):Void;
+    function check_fields(fields:Fields):Bool;
+    function static_ptr():Ptr;
+    function node_value(node:Node):Int64;
+    function node_name(node:Node):CString;
+    function set_node_name(node:Node):Void;
+    function static_pair():Pair;
+    function out_pair(out:Out<Pair>):Void;
+    function unaligned_pair():Pair;
+}
+"#;
+
+fn run_structs(vm: &mut Vm, body: &str) -> Value {
+    vm.run_source("structs.rays", &format!("{STRUCTS}\n{body}"))
+        .unwrap()
+}
+
+#[test]
+fn c_struct_layout_padding_and_nested_fields_match_the_fixture() {
+    with_vm(|vm| {
+        let value = run_structs(
+            vm,
+            r#"
+            var p = alloc(Pair);
+            var zero = [p.x, p.y];
+            p.x = 12; p.y = 0.5;
+            var before = pair_value(p);
+            fill_pair(p, 3, 4.5);
+            var nested = alloc(Nested);
+            fill_nested(nested);
+            var fromC = [nested.tag, nested.pair.x, nested.pair.y, nested.tail];
+            nested.pair = p; nested.tag = 1; nested.tail = 2;
+            nested.pair.x = 8;
+            return [Pair.size == pair_size(), Pair.alignment == pair_align(), Nested.size == nested_size(), Nested.alignment == nested_align(), zero, before, fromC, nested_value(nested), p.x];
+        "#,
+        );
+        assert_eq!(
+            vm.display(value),
+            "[true,true,true,true,[0,0],12.5,[2,3,4.5,6],15.5,3]"
+        );
+    });
+}
+
+#[test]
+fn every_scalar_struct_field_round_trips_through_c() {
+    with_vm(|vm| {
+        let value = run_structs(
+            vm,
+            r#"
+            var f = alloc(Fields); fill_fields(f);
+            var c = [f.i8_, f.u8_, f.i16_, f.u16_, f.i32_, f.u32_, f.i64_, f.u64_, f.size, f.flag, f.float, f.double, f.text];
+            f.i8_ = -128; f.u8_ = 255; f.i16_ = -32768; f.u16_ = 65535;
+            f.i32_ = -2147483648; f.u32_ = 4294967295; f.i64_ = -9223372036854775807; f.u64_ = -1;
+            f.size = -1; f.flag = true; f.float = 1.25; f.double = -2.5;
+            f.text = 'assigned'; f.data = static_ptr(); gc();
+            return [Fields.size == fields_size(), Fields.alignment == fields_align(), c, check_fields(f)];
+        "#,
+        );
+        assert_eq!(
+            vm.display(value),
+            "[true,true,[-128,255,-32768,65535,-2147483648,4294967295,-9223372036854775807,-1,-1,true,1.25,-2.5,fixture],true]"
+        );
+    });
+}
+
+#[test]
+fn struct_arrays_use_c_stride_and_support_element_copy() {
+    with_vm(|vm| {
+        let value = run_structs(
+            vm,
+            r#"
+            var a = alloc(Pair, 3); fill_pairs(a, a.length);
+            var before = pairs_value(a, a.length);
+            a[1].x = 20; a[2] = a[0];
+            var copy = a[2].x; a[0].x = 10;
+            return [a.length, before, copy, a[2].x, pairs_value(a, a.length), alloc(Pair, 0).length];
+        "#,
+        );
+        assert_eq!(vm.display(value), "[3,6.75,0,0,31.75,0]");
+    });
+}
+
+#[test]
+fn nested_and_array_element_views_keep_their_allocation_alive() {
+    with_vm(|vm| {
+        let element = run_structs(
+            vm,
+            r#"
+            function element() { var array = alloc(Pair, 4); fill_pairs(array, 4); return array[3]; }
+            return element();
+        "#,
+        );
+        vm.define_global("element", element);
+        vm.collect();
+        let read = vm.module_global(0, "pair_value").unwrap();
+        assert_eq!(call_text(vm, read, &[element]).unwrap(), "6.25");
+        let value = vm
+            .run_source("view.rays", "element.x = 10; gc(); return element.y;")
+            .unwrap();
+        assert_eq!(vm.display(value), "3.25");
+        let token = vm.module_global(0, "Nested").unwrap();
+        vm.define_global("NestedType", token);
+        let fill = vm.module_global(0, "fill_nested").unwrap();
+        vm.define_global("fillNested", fill);
+        let nested = vm.run_source("nested.rays", "function nested() { var n = alloc(NestedType); fillNested(n); return n.pair; } return nested();").unwrap();
+        vm.define_global("nested", nested);
+        vm.collect();
+        assert_eq!(call_text(vm, read, &[nested]).unwrap(), "7.5");
+    });
+}
+
+#[test]
+fn recursive_pointer_fields_trace_targets_and_cstring_copies_remain_valid() {
+    with_vm(|vm| {
+        let node = run_structs(
+            vm,
+            r#"
+            function nodes() {
+                var a = alloc(Node); var b = alloc(Node);
+                a.value = 3; b.value = 7; a.next = b; b.next = a; a.name = 'first';
+                var copy = alloc(Node, 1); copy[0] = a;
+                a.name = 'second';
+                return copy[0];
+            }
+            return nodes();
+        "#,
+        );
+        vm.define_global("node", node);
+        vm.collect();
+        let read = vm.module_global(0, "node_value").unwrap();
+        let name = vm.module_global(0, "node_name").unwrap();
+        assert_eq!(call_text(vm, read, &[node]).unwrap(), "10");
+        assert_eq!(call_text(vm, name, &[node]).unwrap(), "first");
+        let value = vm
+            .run_source(
+                "linked.rays",
+                "node.next.value = 11; return [node.next.next.value, node.next.value, node.name];",
+            )
+            .unwrap();
+        assert_eq!(vm.display(value), "[3,11,first]");
+        let update = vm.module_global(0, "set_node_name").unwrap();
+        vm.call(update, &[node]).unwrap();
+        assert_eq!(call_text(vm, name, &[node]).unwrap(), "native");
+    });
+}
+
+#[test]
+fn struct_results_outputs_and_explicit_borrowed_arrays_are_pointers() {
+    with_vm(|vm| {
+        let value = run_structs(
+            vm,
+            r#"
+            var p = static_pair();
+            var out = Out(Pair); out_pair(out);
+            var a = alloc(Pair, 3); fill_pairs(a, 3);
+            var view = borrow(Pair, a, 3); view[2].x = 8;
+            return [p.x, out.value.y, view.length, a[2].x, pair_value(view[2])];
+        "#,
+        );
+        assert_eq!(vm.display(value), "[10,0.5,3,8,10.25]");
+    });
+}
+
+const BOXES: &str = r#"
+native "fixture" {
+    @:free(close_box) handle Box;
+    struct Header { session:Session; }
+    function open_box(id:Int64):Box;
+    function close_box(value:Box):Void;
+    @:owner(value) function box_pair(value:Box):Pair;
+    @:owner(value) function box_header(value:Box):Header;
+}
+"#;
+
+#[test]
+fn borrowed_structs_and_handle_fields_retain_owners_and_reject_access_after_close() {
+    with_vm(|vm| {
+        let header = vm.run_source("owned-view.rays", &format!("{HANDLES}\n{STRUCTS}\n{BOXES}\nfunction header() {{ return box_header(open_box(21)); }} return header();")).unwrap();
+        vm.define_global("header", header);
+        vm.collect();
+        let read = vm.module_global(0, "session_id").unwrap();
+        let value = vm
+            .run_source("borrowed.rays", "return header.session;")
+            .unwrap();
+        vm.define_global("borrowed", value);
+        vm.collect();
+        assert_eq!(call_text(vm, read, &[value]).unwrap(), "21");
+        assert!(
+            vm.run_source("close-borrow.rays", "borrowed.close();")
+                .unwrap_err()
+                .contains("close needs a native handle")
+        );
+        let value = vm.run_source("close-owner.rays", &format!("{HANDLES}\n{STRUCTS}\n{BOXES}\nvar owner = open_box(22); var p = box_pair(owner); var h = box_header(owner); var session = h.session; owner.close(); var errors = 0; try {{ p.x; }} catch(e) {{ errors += 1; }} try {{ pair_value(p); }} catch(e) {{ errors += 1; }} try {{ session_id(session); }} catch(e) {{ errors += 1; }} return [errors, p == null, session == null];")).unwrap();
+        assert_eq!(vm.display(value), "[3,true,true]");
+    });
+}
+
+#[test]
+fn struct_errors_are_reported_before_invalid_memory_access() {
+    with_vm(|vm| {
+        for declaration in [
+            "struct Empty {}",
+            "struct Bad { x:Void; }",
+            "struct Bad { x:Missing; }",
+            "struct Loop { inner:Loop; }",
+            "struct A { b:B; } struct B { a:A; }",
+            "struct Bad { x:Int32; x:Double; }",
+            "struct Int32 { x:Int32; }",
+            "struct Bad { x:Ptr<Int32>; }",
+            "struct Bad { x:Out<Int32>; }",
+        ] {
+            let source = format!("native \"fixture\" {{ {declaration} }}");
+            assert!(
+                vm.run_source("bad-layout.rays", &source).is_err(),
+                "{declaration}"
+            );
+        }
+        for body in [
+            "alloc(Pair, -1);",
+            "alloc(Pair, 9223372036854775807);",
+            "alloc(Int32);",
+            "borrow(Pair, null);",
+            "borrow(Pair, Bytes(1));",
+            "borrow(Pair, alloc(Pair), 2);",
+            "var p = alloc(Pair); p.x = 2147483648;",
+            "var p = alloc(Pair); p.nope;",
+            "alloc(Pair, 0)[0];",
+            "alloc(Pair, 1)[-1];",
+            "alloc(Pair, 1)[1];",
+            "alloc(Pair, 1).x;",
+            "alloc(Pair, 1)[0] = alloc(Node);",
+            "alloc(Nested).pair = alloc(Node);",
+            "Pair.size = 0;",
+            "unaligned_pair();",
+            "pair_value(alloc(Node));",
+            "var n = alloc(Node); n.name = 'bad\\x00string';",
+            "var n = alloc(Node); n.next = alloc(Pair);",
+        ] {
+            let source = format!("{STRUCTS}\n{body}");
+            assert!(vm.run_source("bad-struct.rays", &source).is_err(), "{body}");
+        }
+    });
+}
+
+#[test]
+fn bound_struct_calls_retain_types_and_libraries_after_registration_replacement() {
+    with_vm(|vm| {
+        let pair = run_structs(vm, "var p = alloc(Pair); p.x = 6; p.y = 0.5; return p;");
+        let read = vm.module_global(0, "pair_value").unwrap();
+        vm.define_global("kept", pair);
+        unsafe {
+            vm.register_native_library("fixture", "/no/such/replacement");
+        }
+        vm.collect();
+        assert_eq!(call_text(vm, read, &[pair]).unwrap(), "6.5");
+    });
+}
+
+#[test]
+fn returned_aliases_share_vm_storage_and_keep_assigned_strings_alive() {
+    with_vm(|vm| {
+        let node = run_structs(
+            vm,
+            r#"
+            native "fixture" { function identity_node(node:Node):Node; }
+            function alias() { var a = alloc(Node); a.name = 'alias'; return identity_node(a); }
+            return alias();
+        "#,
+        );
+        vm.define_global("alias", node);
+        vm.collect();
+        let name = vm.module_global(0, "node_name").unwrap();
+        assert_eq!(call_text(vm, name, &[node]).unwrap(), "alias");
+        let result = vm
+            .run_source(
+                "alias-string.rays",
+                "alias.name = 'changed'; gc(); return alias.name;",
+            )
+            .unwrap();
+        assert_eq!(vm.display(result), "changed");
+        let raw = vm.run_source("raw-alias.rays", &format!("{STRUCTS}\nnative \"fixture\" {{ function identity_ptr(p:Ptr):Ptr; }} function raw() {{ var p = alloc(Pair); p.x = 18; p.y = 0.5; return identity_ptr(p); }} return raw();")).unwrap();
+        vm.define_global("raw", raw);
+        vm.collect();
+        let result = vm
+            .run_source(
+                "borrow-raw.rays",
+                &format!("{STRUCTS}\nreturn pair_value(borrow(Pair, raw));"),
+            )
+            .unwrap();
+        assert_eq!(vm.display(result), "18.5");
+    });
+}
+
+#[test]
+fn c_written_pointer_fields_retain_vm_allocations_and_managed_handles() {
+    with_vm(|vm| {
+        let node = run_structs(
+            vm,
+            r#"
+            native "fixture" { function link_nodes(a:Node, b:Node):Void; }
+            function linked() { var a = alloc(Node); var b = alloc(Node); a.value = 4; b.value = 9; link_nodes(a, b); return a; }
+            return linked();
+        "#,
+        );
+        vm.define_global("linked", node);
+        vm.collect();
+        let read = vm.module_global(0, "node_value").unwrap();
+        assert_eq!(call_text(vm, read, &[node]).unwrap(), "13");
+        let header = vm.run_source("managed-header.rays", &format!("{HANDLES}\nnative \"fixture\" {{ struct ManagedHeader {{ session:Session; }} function put_session(header:ManagedHeader, session:Session):Void; }} function managed() {{ var h = alloc(ManagedHeader); var s = session(23); put_session(h, s); return h; }} return managed();")).unwrap();
+        vm.define_global("header", header);
+        vm.collect();
+        let count = vm.module_global(1, "freed_count").unwrap();
+        assert_eq!(call_text(vm, count, &[]).unwrap(), "0");
+        let result = vm
+            .run_source(
+                "read-header.rays",
+                &format!("{HANDLES}\nreturn session_id(header.session);"),
+            )
+            .unwrap();
+        assert_eq!(vm.display(result), "23");
+        vm.define_global("header", Value::Nil);
+        vm.collect();
+        assert_eq!(call_text(vm, count, &[]).unwrap(), "1");
+    });
+}
+
+#[test]
+fn closed_pointer_fields_can_be_cleared_and_c_owned_pointer_writes_are_rejected() {
+    with_vm(|vm| {
+        let result = vm.run_source("repair.rays", &format!("{HANDLES}\nnative \"fixture\" {{ struct Holder {{ session:Session; }} function identity_ptr(p:Ptr):Ptr; }} var h = alloc(Holder); var s = session(24); h.session = s; s.close(); var invalid = false; try {{ identity_ptr(h); }} catch(e) {{ invalid = true; }} var closed = h.session == null; h.session = null; identity_ptr(h); return [invalid, closed, h.session];")).unwrap();
+        assert_eq!(vm.display(result), "[true,true,null]");
+        let result = run_structs(
+            vm,
+            r#"
+            native "fixture" { function static_node():Node; }
+            var n = static_node(); var rejected = false;
+            try { n.name = 'temporary'; } catch(e) { rejected = true; }
+            n.value = 6;
+            var old = n.name; n.name = null;
+            return [rejected, old, n.value, n.name];
+        "#,
+        );
+        assert_eq!(vm.display(result), "[true,static,6,null]");
+        let error = vm.run_source("past-end.rays", &format!("{STRUCTS}\nnative \"fixture\" {{ function one_past_pair(a:Pair, count:SizeT):Pair; }} one_past_pair(alloc(Pair, 3), 3);")).unwrap_err();
+        assert!(error.contains("exceeds allocated storage"), "{error}");
+        let result = vm.run_source("end-pointer.rays", &format!("{STRUCTS}\nnative \"fixture\" {{ function one_past_pair(a:Pair, count:SizeT):Ptr; }} var a = alloc(Pair, 3); var end = one_past_pair(a, 3); return [end != null, Bytes(end, 0).length, borrow(Pair, end, 0).length];")).unwrap();
+        assert_eq!(vm.display(result), "[true,0,0]");
+    });
+}
+
+#[test]
+fn struct_storage_pressure_is_counted_once_across_aliases_and_released() {
+    with_vm(|vm| {
+        vm.run_source(
+            "type.rays",
+            "native \"fixture\" { struct Pair { x:Int32; y:Double; } }",
+        )
+        .unwrap();
+        let token = vm.module_global(0, "Pair").unwrap();
+        let alloc = vm.global("alloc").unwrap();
+        let before = vm.heap_stats().external;
+        let array = vm.call(alloc, &[token, Value::Int(8)]).unwrap();
+        vm.define_global("array", array);
+        let owned = vm.heap_stats().external;
+        assert_eq!(owned - before, 128);
+        let borrow = vm.global("borrow").unwrap();
+        let alias = vm.call(borrow, &[token, array]).unwrap();
+        vm.define_global("element", alias);
+        assert_eq!(vm.heap_stats().external, owned);
+        vm.define_global("array", Value::Nil);
+        vm.collect();
+        assert_eq!(vm.heap_stats().external, owned);
+        vm.define_global("element", Value::Nil);
+        vm.collect();
+        assert_eq!(vm.heap_stats().external, before);
+    });
+}
+
+#[test]
+fn compatible_struct_declarations_are_shared_across_native_blocks() {
+    with_vm(|vm| {
+        let result = run_structs(
+            vm,
+            r#"
+            native "fixture" {
+                struct Pair { x:Int32; y:Double; }
+                struct External { tag:UInt8; pair:Pair; tail:UInt16; }
+                function fill_nested(n:External):Void;
+            }
+            var n = alloc(External); fill_nested(n);
+            return [n.pair.x, n.pair.y, pair_value(n.pair)];
+        "#,
+        );
+        assert_eq!(vm.display(result), "[3,4.5,7.5]");
+        let error = vm
+            .run_source(
+                "conflict.rays",
+                "native \"fixture\" { struct Pair { x:Int64; y:Double; } }",
+            )
+            .unwrap_err();
+        assert!(error.contains("different definition"), "{error}");
+    });
+}

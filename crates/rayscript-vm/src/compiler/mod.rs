@@ -438,6 +438,20 @@ impl Compiler {
             self.emit(Op::DefGlobal { src: t, name });
             self.free_to(m);
         }
+        let structs = n.structs.iter().map(|st| {
+            std::iter::once(st.name.name.clone()).chain(st.fields.iter().map(|f| format!("{}:{}", f.name.name, rayscript_syntax::dump::ty(&f.ty)))).collect::<Vec<_>>().join("\t")
+        }).collect::<Vec<_>>().join("\n");
+        for st in &n.structs {
+            self.at(st.span);
+            if !names.insert(&st.name.name) { self.error(st.span, "duplicate native type name"); }
+            let k = self.const_str(&format!("{}\0{}\0struct\0{}", n.library, st.name.name, structs));
+            let m = self.mark();
+            let t = self.alloc();
+            self.emit(Op::BindNative { dst: t, spec: k });
+            let name = self.const_str(&st.name.name);
+            self.emit(Op::DefGlobal { src: t, name });
+            self.free_to(m);
+        }
         for f in &n.functions {
             for param in &f.params {
                 if param.rest || param.optional || param.default.is_some() {

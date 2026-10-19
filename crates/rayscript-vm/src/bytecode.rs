@@ -106,6 +106,7 @@ pub enum Op {
     ImportAll { path: u32 },
     /// Binds a function (`library\0name\0signature\0flags`) or handle type
     /// (`library\0name\0handle\0free_symbol`) from a string constant.
+    /// A struct uses `library\0name\0struct\0definitions`, with tab-separated fields and one type per line.
     BindNative { dst: Reg, spec: u32 },
 
     /// Pattern tests: whether `src` is an array of exactly (or at least) `len` elements, an object, or has a field.

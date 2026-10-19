@@ -232,3 +232,253 @@ pub unsafe extern "C" fn handle_and_bad_string(text: *mut *const c_char, out: *m
         *out = Box::into_raw(Box::new(Session { id: 15 }));
     }
 }
+
+#[repr(C)]
+pub struct Pair {
+    pub x: i32,
+    pub y: f64,
+}
+#[repr(C)]
+pub struct Nested {
+    pub tag: u8,
+    pub pair: Pair,
+    pub tail: u16,
+}
+#[repr(C)]
+pub struct Node {
+    pub value: i64,
+    pub next: *mut Node,
+    pub name: *const c_char,
+}
+#[repr(C)]
+pub struct Fields {
+    pub i8_: i8,
+    pub u8_: u8,
+    pub i16_: i16,
+    pub u16_: u16,
+    pub i32_: i32,
+    pub u32_: u32,
+    pub i64_: i64,
+    pub u64_: u64,
+    pub size: usize,
+    pub flag: u8,
+    pub float: f32,
+    pub double: f64,
+    pub text: *const c_char,
+    pub data: *mut std::ffi::c_void,
+}
+#[repr(C)]
+pub struct HandleHeader {
+    pub session: *mut Session,
+}
+#[repr(C)]
+pub struct BoxedPair {
+    pub session: Session,
+    pub pair: Pair,
+    pub header: HandleHeader,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pair_size() -> usize {
+    std::mem::size_of::<Pair>()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn pair_align() -> usize {
+    std::mem::align_of::<Pair>()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nested_size() -> usize {
+    std::mem::size_of::<Nested>()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nested_align() -> usize {
+    std::mem::align_of::<Nested>()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn fields_size() -> usize {
+    std::mem::size_of::<Fields>()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn fields_align() -> usize {
+    std::mem::align_of::<Fields>()
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pair_value(pair: *const Pair) -> f64 {
+    unsafe { (*pair).x as f64 + (*pair).y }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fill_pair(pair: *mut Pair, x: i32, y: f64) {
+    unsafe {
+        *pair = Pair { x, y };
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fill_nested(n: *mut Nested) {
+    unsafe {
+        *n = Nested {
+            tag: 2,
+            pair: Pair { x: 3, y: 4.5 },
+            tail: 6,
+        };
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nested_value(n: *const Nested) -> f64 {
+    unsafe { (*n).tag as f64 + (*n).pair.x as f64 + (*n).pair.y + (*n).tail as f64 }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fill_pairs(pairs: *mut Pair, count: usize) {
+    for n in 0..count {
+        unsafe {
+            pairs.add(n).write(Pair {
+                x: n as i32,
+                y: n as f64 + 0.25,
+            });
+        }
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pairs_value(pairs: *const Pair, count: usize) -> f64 {
+    (0..count)
+        .map(|n| unsafe { (*pairs.add(n)).x as f64 + (*pairs.add(n)).y })
+        .sum()
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fill_fields(f: *mut Fields) {
+    unsafe {
+        *f = Fields {
+            i8_: -128,
+            u8_: 255,
+            i16_: -32768,
+            u16_: 65535,
+            i32_: i32::MIN,
+            u32_: u32::MAX,
+            i64_: i64::MIN + 1,
+            u64_: u64::MAX,
+            size: usize::MAX,
+            flag: 1,
+            float: 1.25,
+            double: -2.5,
+            text: c"fixture".as_ptr(),
+            data: static_ptr().cast_mut().cast(),
+        };
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn check_fields(f: *const Fields) -> bool {
+    let f = unsafe { &*f };
+    f.i8_ == -128
+        && f.u8_ == 255
+        && f.i16_ == -32768
+        && f.u16_ == 65535
+        && f.i32_ == i32::MIN
+        && f.u32_ == u32::MAX
+        && f.i64_ == i64::MIN + 1
+        && f.u64_ == u64::MAX
+        && f.size == usize::MAX
+        && f.flag == 1
+        && f.float == 1.25
+        && f.double == -2.5
+        && unsafe { CStr::from_ptr(f.text) }.to_bytes() == b"assigned"
+        && unsafe { read_ptr(f.data.cast()) } == 12345
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn node_value(node: *const Node) -> i64 {
+    unsafe {
+        (*node).value
+            + if (*node).next.is_null() {
+                0
+            } else {
+                (*(*node).next).value
+            }
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn node_name(node: *const Node) -> *const c_char {
+    unsafe { (*node).name }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn set_node_name(node: *mut Node) {
+    unsafe {
+        (*node).name = c"native".as_ptr();
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn static_pair() -> *mut Pair {
+    // Each test mutates a separate cell; C pointers are used only on the invoking VM thread.
+    thread_local! { static PAIR: std::cell::UnsafeCell<Pair> = const { std::cell::UnsafeCell::new(Pair { x: 10, y: 0.5 }) }; }
+    PAIR.with(|p| p.get())
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn out_pair(out: *mut *mut Pair) {
+    unsafe {
+        *out = static_pair();
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn unaligned_pair() -> *mut Pair {
+    1usize as *mut Pair
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn open_box(id: i64) -> *mut BoxedPair {
+    let mut value = Box::new(BoxedPair {
+        session: Session { id },
+        pair: Pair {
+            x: id as i32,
+            y: 0.5,
+        },
+        header: HandleHeader {
+            session: std::ptr::null_mut(),
+        },
+    });
+    value.header.session = &raw mut value.session;
+    Box::into_raw(value)
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn close_box(value: *mut BoxedPair) {
+    let value = unsafe { Box::from_raw(value) };
+    FREED.with(|f| f.borrow_mut().push(value.session.id));
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn box_pair(value: *mut BoxedPair) -> *mut Pair {
+    unsafe { &raw mut (*value).pair }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn box_session(value: *mut BoxedPair) -> *mut Session {
+    value.cast()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn box_header(value: *mut BoxedPair) -> *mut HandleHeader {
+    unsafe { &raw mut (*value).header }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn identity_pair(pair: *mut Pair) -> *mut Pair {
+    pair
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn identity_node(node: *mut Node) -> *mut Node {
+    node
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn one_past_pair(pair: *mut Pair, count: usize) -> *mut Pair {
+    unsafe { pair.add(count) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn link_nodes(node: *mut Node, next: *mut Node) {
+    unsafe {
+        (*node).next = next;
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn put_session(header: *mut HandleHeader, session: *mut Session) {
+    unsafe {
+        (*header).session = session;
+    }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn static_node() -> *mut Node {
+    thread_local! { static NODE: std::cell::UnsafeCell<Node> = const { std::cell::UnsafeCell::new(Node { value: 0, next: std::ptr::null_mut(), name: c"static".as_ptr() }) }; }
+    NODE.with(|n| n.get())
+}

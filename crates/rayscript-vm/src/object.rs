@@ -269,7 +269,10 @@ impl Obj {
 pub fn trace_children(obj: Obj, f: &mut dyn FnMut(Value)) {
     match obj.kind() {
         Kind::String | Kind::Range | Kind::Bytes => {}
-        Kind::Host => { for value in &obj.host_ref().references { f(*value); } }
+        Kind::Host => {
+            for value in &obj.host_ref().references { f(*value); }
+            crate::vm::ffi::trace_host(obj, f);
+        }
         Kind::Array => {
             for v in &obj.array().items {
                 f(*v);

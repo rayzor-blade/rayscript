@@ -1,5 +1,7 @@
 //! C calls with typed output slots and traced native ownership. Library names are resolved only through the embedder's explicit registrations.
 
+mod structure;
+
 use super::{NativeResult, Vm};
 use crate::{Value, object::Kind};
 use libffi::middle::{Cif, CodePtr, Type};
@@ -17,6 +19,10 @@ pub(crate) struct Libraries {
     paths: HashMap<String, PathBuf>,
     loaded: HashMap<String, Rc<Library>>,
     types: HashMap<(String, String), Rc<HandleType>>,
+    structures: HashMap<(String, String), structure::StructType>,
+    struct_backings: Vec<Weak<structure::Backing>>,
+    struct_bytes: Rc<Cell<usize>>,
+    accounted_struct_bytes: usize,
     releases: Rc<RefCell<Vec<Release>>>,
 }
 
@@ -123,6 +129,7 @@ enum NativeType {
     Ptr,
     Bytes,
     Handle(Rc<HandleType>),
+    Struct(structure::StructType),
     Out(Box<NativeType>),
 }
 
@@ -134,6 +141,17 @@ impl NativeType {
                 return Err(format!("unsupported output type `{inner}`"));
             }
             return Ok(Self::Out(Box::new(ty)));
+        }
+        if let Some(inner) = name.strip_prefix("Ptr<").and_then(|s| s.strip_suffix('>')) {
+            return libraries
+                .structures
+                .get(&(library.into(), inner.into()))
+                .cloned()
+                .map(Self::Struct)
+                .ok_or_else(|| format!("Ptr<T> needs a declared struct, found `{inner}`"));
+        }
+        if let Some(ty) = libraries.structures.get(&(library.into(), name.into())) {
+            return Ok(Self::Struct(ty.clone()));
         }
         Ok(match name {
             "Ptr" => Self::Ptr,
@@ -157,6 +175,7 @@ impl NativeType {
             (Self::Scalar(a), Self::Scalar(b)) => a == b,
             (Self::Ptr, Self::Ptr) | (Self::Bytes, Self::Bytes) => true,
             (Self::Handle(a), Self::Handle(b)) => Rc::ptr_eq(a, b),
+            (Self::Struct(a), Self::Struct(b)) => a.same(b),
             (Self::Out(a), Self::Out(b)) => a.same(b),
             _ => false,
         }
@@ -221,8 +240,16 @@ enum Foreign {
         ptr: *mut c_void,
         owner: Option<Rc<Resource>>,
         _library: Rc<Library>,
+        structure: Option<Rc<structure::Backing>>,
     },
     Handle(Rc<Resource>),
+    Struct(structure::View),
+    BorrowedHandle {
+        ty: Rc<HandleType>,
+        ptr: *mut c_void,
+        backing: Rc<structure::Backing>,
+        guard: Option<(Value, Rc<Resource>)>,
+    },
     Out {
         ty: NativeType,
         slot: Box<UnsafeCell<Slot>>,
@@ -239,13 +266,33 @@ fn foreign(value: Value) -> Option<&'static Foreign> {
 }
 
 pub(crate) fn closed(value: Value) -> bool {
-    match foreign(value) {
-        Some(Foreign::Handle(resource)) => resource.ptr.get().is_null(),
-        Some(Foreign::Pointer {
-            owner: Some(owner), ..
-        }) => owner.ptr.get().is_null(),
-        _ => false,
-    }
+    structure::storage_closed_value(value, &mut std::collections::HashSet::new())
+}
+
+pub(crate) fn trace_host(obj: crate::value::Obj, f: &mut dyn FnMut(Value)) {
+    structure::trace(Value::Obj(obj), f);
+}
+
+pub(crate) fn set_field(
+    obj: crate::value::Obj,
+    name: &str,
+    value: Value,
+) -> Option<Result<(), String>> {
+    structure::set_field(obj, name, value)
+}
+pub(crate) fn get_index(
+    vm: &mut Vm,
+    obj: crate::value::Obj,
+    index: Value,
+) -> Option<Result<Value, String>> {
+    structure::get_index(vm, obj, index)
+}
+pub(crate) fn set_index(
+    obj: crate::value::Obj,
+    index: Value,
+    value: Value,
+) -> Option<Result<(), String>> {
+    structure::set_index(obj, index, value)
 }
 
 pub(crate) fn display_host(obj: crate::value::Obj) -> Option<String> {
@@ -265,10 +312,26 @@ pub(crate) fn display_host(obj: crate::value::Obj) -> Option<String> {
             }
         }
         Foreign::Out { .. } => "<out>".into(),
+        Foreign::Struct(_) => if closed(Value::Obj(obj)) {
+            "null"
+        } else {
+            "<native struct>"
+        }
+        .into(),
+        Foreign::BorrowedHandle { .. } => if closed(Value::Obj(obj)) {
+            "null"
+        } else {
+            "<borrowed handle>"
+        }
+        .into(),
     })
 }
 
-pub(crate) fn get_field(obj: crate::value::Obj, name: &str) -> Option<Result<Value, String>> {
+pub(crate) fn get_field(
+    vm: &mut Vm,
+    obj: crate::value::Obj,
+    name: &str,
+) -> Option<Result<Value, String>> {
     match (foreign(Value::Obj(obj))?, name) {
         (Foreign::Out { .. }, "value") => Some(Ok(obj
             .host_ref()
@@ -276,11 +339,12 @@ pub(crate) fn get_field(obj: crate::value::Obj, name: &str) -> Option<Result<Val
             .first()
             .copied()
             .unwrap_or(Value::Nil))),
-        _ => None,
+        _ => structure::get_field(vm, obj, name),
     }
 }
 
 pub(crate) fn install(vm: &mut Vm) {
+    structure::install(vm);
     for name in [
         "Void", "Int8", "Int16", "Int32", "Int64", "Int", "UInt8", "UInt16", "UInt32", "UInt64",
         "SizeT", "Bool", "Float", "Double", "CString", "Ptr",
@@ -424,6 +488,17 @@ struct Bound {
 }
 
 impl Vm {
+    pub(crate) fn sync_native_storage(&mut self) {
+        let bytes = self.foreign.struct_bytes.get();
+        let previous = self.foreign.accounted_struct_bytes;
+        if bytes >= previous {
+            self.heap.track_external((bytes - previous) as isize);
+        } else {
+            self.heap.track_external(-((previous - bytes) as isize));
+        }
+        self.foreign.accounted_struct_bytes = bytes;
+    }
+
     /// A fixed-size native buffer. Scripts read and write bytes by index.
     pub fn new_bytes(&mut self, data: Vec<u8>) -> Value {
         self.alloc(Kind::Bytes, |header| crate::object::BytesObj {
@@ -450,6 +525,9 @@ impl Vm {
             .insert(name.into(), path.as_ref().to_path_buf());
         self.foreign.loaded.remove(name);
         self.foreign.types.retain(|(library, _), _| library != name);
+        self.foreign
+            .structures
+            .retain(|(library, _), _| library != name);
     }
 
     fn native_library(&mut self, library: &str) -> Result<Rc<Library>, String> {
@@ -487,7 +565,17 @@ impl Vm {
         flags: &str,
         name: &str,
     ) -> Result<Value, String> {
+        if signature == "struct" {
+            return structure::bind(self, library, symbol, flags);
+        }
         if signature == "handle" {
+            if self
+                .foreign
+                .structures
+                .contains_key(&(library.into(), symbol.into()))
+            {
+                return Err("native type already declared as a struct".into());
+            }
             if Scalar::parse(symbol).is_ok() || ["Ptr", "Bytes", "Out"].contains(&symbol) {
                 return Err("handle name conflicts with a built-in native type".into());
             }
@@ -553,7 +641,7 @@ impl Vm {
             if !matches!(args.get(index), Some(NativeType::Handle(_))) {
                 return Err("@:owner parameter must be a handle".into());
             }
-            if !matches!(ret, NativeType::Handle(_) | NativeType::Ptr) && !args.iter().any(|a| matches!(a, NativeType::Out(t) if matches!(**t, NativeType::Handle(_) | NativeType::Ptr))) {
+            if !matches!(ret, NativeType::Handle(_) | NativeType::Ptr | NativeType::Struct(_)) && !args.iter().any(|a| matches!(a, NativeType::Out(t) if matches!(**t, NativeType::Handle(_) | NativeType::Ptr | NativeType::Struct(_)))) {
                 return Err("@:owner needs a handle or pointer result or output".into());
             }
         }
@@ -671,6 +759,11 @@ impl Bound {
                     }
                 }
             }
+            if let Err(error) = structure::refresh(vm, args, result.as_ref().ok().copied()) {
+                if result.is_ok() {
+                    result = Err(error);
+                }
+            }
             result
         })();
         for string in scratch.strings.iter_mut() {
@@ -693,6 +786,7 @@ impl Bound {
                 Value::Obj(o) if o.kind() == Kind::Bytes => o.bytes().as_mut_ptr().cast(),
                 _ => return Err("expected Bytes".into()),
             },
+            NativeType::Struct(ty) => structure::struct_pointer(value, ty)?,
             NativeType::Handle(ty) => match foreign(value) {
                 Some(Foreign::Handle(r)) if Rc::ptr_eq(ty, &r.ty) => {
                     if r.ptr.get().is_null() {
@@ -700,6 +794,7 @@ impl Bound {
                     }
                     r.ptr.get()
                 }
+                Some(Foreign::BorrowedHandle { .. }) => structure::handle_pointer(value, ty)?,
                 _ if matches!(value, Value::Nil) => std::ptr::null_mut(),
                 _ => return Err(format!("expected handle {} or null", ty.name)),
             },
@@ -750,7 +845,11 @@ impl Bound {
                 ptr: unsafe { slot.ptr.cast_mut().cast() },
                 owner: owner.map(|(_, r)| r.clone()),
                 _library: self.library.clone(),
+                structure: structure::known(vm, unsafe { slot.ptr.cast_mut().cast() }, 0)?,
             },
+            NativeType::Struct(ty) => {
+                return structure::returned(vm, ty, unsafe { slot.ptr.cast_mut().cast() }, owner);
+            }
             NativeType::Handle(ty) => {
                 let ptr = unsafe { slot.ptr.cast_mut().cast::<c_void>() };
                 if ptr.is_null() {
@@ -809,8 +908,18 @@ fn pointer(value: Value) -> Result<*mut c_void, String> {
         return Err("pointer or handle is closed".into());
     }
     match foreign(value) {
-        Some(Foreign::Pointer { ptr, .. }) => Ok(*ptr),
+        Some(Foreign::Pointer { ptr, structure, .. }) => {
+            if let Some(backing) = structure {
+                backing.check()?;
+            }
+            Ok(*ptr)
+        }
         Some(Foreign::Handle(r)) => Ok(r.ptr.get()),
+        Some(Foreign::BorrowedHandle { ptr, backing, .. }) => {
+            backing.check()?;
+            Ok(*ptr)
+        }
+        Some(Foreign::Struct(view)) => view.address(),
         _ => match value {
             Value::Obj(o) if o.kind() == Kind::Bytes => Ok(o.bytes().as_mut_ptr().cast()),
             _ => Err("expected Ptr, handle, Bytes or null".into()),

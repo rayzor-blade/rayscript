@@ -45,6 +45,7 @@ Registration is unsafe: loading a library executes its initialization code, and 
 | `Out<T>` | `T *` | Typed output slot constructed with `Out(T)`; arguments only. |
 | Declared handle | Opaque pointer | Matching handle or null. |
 | `Bytes` | `unsigned char *` | Fixed-size buffer; arguments only. |
+| Declared struct, `Ptr<Struct>` | `struct T *` | Struct view, struct array or null; structs are never passed by value. |
 
 Integer operations and comparisons in the VM remain signed, including values transported through `UInt64`. No value is converted through a floating-point number to represent an unsigned integer.
 
@@ -78,9 +79,9 @@ session.close();
 
 Native blocks declare handles before binding their functions, regardless of source order. Each handle requires one `@:free(function)` annotation and a matching `function free(value:Handle):Void;` declaration in the same block. The free symbol is resolved when the handle type is bound. Native type names become script values accepted by `Out(T)`.
 
-`Out(T)` supports scalar types, `CString`, `Ptr` and declared handles. Its `.value` is null until a call writes it. Each call zeroes the slot and copies or wraps its result immediately after returning, including when the C function returns an error code. Error-code handling remains the script's responsibility. Slots cannot be passed twice in one call. A slot containing an open handle cannot be reused until that handle is closed; this prevents losing an owned allocation. `.value` is read-only.
+`Out(T)` supports scalar types, `CString`, `Ptr`, declared handles and structs. For a struct, `Out<Struct>` is a pointer-to-pointer slot; `alloc(Struct)` supplies a direct writable struct pointer. Its `.value` is null until a call writes it. Each call zeroes the slot and copies or wraps its result immediately after returning, including when the C function returns an error code. Error-code handling remains the script's responsibility. Slots cannot be passed twice in one call. A slot containing an open handle cannot be reused until that handle is closed; this prevents losing an owned allocation. `.value` is read-only.
 
-`@:owner(parameter)` retains the named handle for returned handles and pointers, including output slots. Owner arguments must be open handles. Child handles trace their owners through the collector and retain their native resources independently of heap sweep order. An owner can outlive its last direct script reference while a child remains reachable.
+`@:owner(parameter)` retains the named handle for returned handles, pointers and struct views, including output slots. Owner arguments must be open handles. Child handles trace their owners through the collector and retain their native resources independently of heap sweep order. An owner can outlive its last direct script reference while a child remains reachable.
 
 `handle.close()` immediately frees child handles before the handle, invalidates all its aliases and borrowed pointers, and can be called repeatedly. Calling the declared free function has the same effect. Closed handles compare equal to null and are false in conditions; passing one to a native function raises an error. Repeated returns of the same live address and handle type share ownership; conflicting owner declarations raise an error.
 
@@ -103,6 +104,41 @@ var independent = bytes.copy();
 
 `Bytes(pointer, length)` copies native data into a new buffer. Null is accepted only with length zero. When the source is another `Bytes`, the length is checked against its capacity. For opaque pointers and handles, the registered library and trusted script must guarantee valid readable memory for the given length. Native buffer arguments likewise require a correct length and must not be retained by C after the call. A raw `Ptr` does not transfer ownership; `@:owner` is required for borrowed pointers that depend on a handle.
 
+## Structs and arrays
+
+```haxe
+native "fixture" {
+  struct Pair { x:Int32; y:Double; }
+  struct Nested { tag:UInt8; pair:Pair; tail:UInt16; }
+  struct Node { value:Int64; next:Ptr<Node>; name:CString; }
+  function fill_pair(pair:Pair, x:Int32, y:Double):Void;
+  function fill_pairs(pairs:Pair, count:SizeT):Void;
+  function pairs_value(pairs:Pair, count:SizeT):Double;
+}
+var pair = alloc(Pair);
+pair.x = 2;
+pair.y = 0.5;
+fill_pair(pair, 3, 4.5);
+var array = alloc(Pair, 3);
+fill_pairs(array, array.length);
+array[1].x = 8;
+trace(pairs_value(array, array.length));
+```
+
+Layouts use C field alignment, inter-field padding and tail padding. `Type.size` and `Type.alignment` describe the layout. Native blocks resolve forward references between structs, allow recursive `Ptr<T>` links and reject recursive inline values. Empty and packed structs, unions and fixed-size array fields are unsupported.
+
+In a function signature, `Pair` and `Ptr<Pair>` both mean a pointer. In a field declaration, `pair:Pair` embeds a struct and `pair:Ptr<Pair>` stores a pointer. Fields support native scalars, `CString`, `Ptr`, declared handles, embedded structs and pointers to structs. Struct values are not passed or returned by value.
+
+`alloc(Type)` returns zeroed struct storage. `alloc(Type, count)` returns a fixed-length array with read-only `.length`; count may be zero. Arrays require an index before field access. Indexes are checked, and an element or nested view retains the entire allocation. Struct assignments copy the C bytes while retaining pointer dependencies and assigned C strings. Changing a source string field later does not invalidate a previously copied string pointer. Native struct allocations contribute to GC pressure once per shared allocation.
+
+`borrow(Type, pointer[, count])` creates a view without copying. The pointer must be aligned; known VM storage bounds are checked. Native pointer bounds remain part of the registered library's memory contract. A count creates an indexed array view. Native struct results and `Out<Struct>.value` are borrowed views; `@:owner(handle)` links them to a C allocation's lifetime. Closing that owner invalidates the views and their borrowed fields. Structs themselves have no `close()` method.
+
+Returned pointers into known VM struct storage share its allocation and field retainers. The VM also captures managed struct pointers and handles that C writes into VM-owned pointer fields before collection. Native code must not retain VM storage after a call unless the script keeps it alive for that use.
+
+Assigning a `CString` field copies NUL-terminated UTF-8 storage. Assigned pointers and handles are traced while their field still refers to them. Reading a handle field borrows its lifetime; a pointer already managed by the VM shares that existing resource. Borrowed handles cannot be freed with `close()`. Calls reject struct fields referring to closed managed handles; fields in live storage can be cleared or replaced.
+
+Non-null pointer-bearing fields in C-owned storage are read-only, including `CString` and pointer-bearing embedded struct copies. Such writes could leave C referring to storage whose VM view has been collected. Scalar writes and clearing pointers to null are supported; use `alloc(Type)` for fully writable structs. Views backed by VM byte buffers are writable and retain the buffer.
+
 ## Checking
 
 ```sh
@@ -111,8 +147,8 @@ cargo run -p rayscript-vm --example native
 cargo test --release -p rayscript-vm --test native scalar_call_overhead -- --ignored --nocapture
 ```
 
-The `rayscript-ffi-fixture` workspace crate builds a Rust C-ABI shared library before the VM's native-call tests. It covers integer widths, booleans, floating-point values, mixed signatures, strings, nulls, void results, typed outputs, buffers and owned handles. Tests also cover registration and symbol failures, argument errors, library lifetime, owner tracing, child-before-parent frees, use after close, aliases and allocations during repeated scalar calls. The ignored release benchmark compares a scalar call with a Rust closure native; measurements belong in the tracker.
+The `rayscript-ffi-fixture` workspace crate builds a Rust C-ABI shared library before the VM's native-call tests. It covers integer widths, booleans, floating-point values, mixed signatures, strings, nulls, void results, typed outputs, buffers, owned handles, C layouts, nested structs, arrays and borrowed views. Tests also cover registration and symbol failures, argument errors, library lifetime, owner tracing, child-before-parent frees, use after close, aliases and allocations during repeated scalar calls. The ignored release benchmark compares a scalar call with a Rust closure native; measurements belong in the tracker.
 
 ## Limits
 
-Structs, callbacks and worker lanes are not implemented. Function annotations other than `@:owner`, including `@:blocking`, are rejected rather than silently ignored. The initial target is macOS arm64; other targets require their own ABI tests. Structs by value, unions and variadic calls are outside v1.
+Callbacks and worker lanes are not implemented. Function annotations other than `@:owner`, including `@:blocking`, are rejected rather than silently ignored. The initial target is macOS arm64; other targets require their own ABI tests. Structs by value, unions and variadic calls are outside v1.

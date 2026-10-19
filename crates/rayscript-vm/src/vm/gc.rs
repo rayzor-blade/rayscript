@@ -61,6 +61,7 @@ impl Vm {
         }
         self.heap.end_collect(|h| unsafe { drop_object(h) });
         self.foreign.drain();
+        self.sync_native_storage();
         self.collections += 1;
     }
 

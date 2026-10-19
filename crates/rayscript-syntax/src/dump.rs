@@ -29,6 +29,11 @@ pub fn dump_item(item: &Item) -> String {
                 }
                 s.push(')');
             }
+            for st in &n.structs {
+                write!(s, " (struct {}", st.name.name).unwrap();
+                for field in &st.fields { write!(s, " ({} {})", field.name.name, ty(&field.ty)).unwrap(); }
+                s.push(')');
+            }
             for f in &n.functions {
                 write!(s, " (fn {} ({})", f.name.name, params(&f.params)).unwrap();
                 if let Some(r) = &f.ret {

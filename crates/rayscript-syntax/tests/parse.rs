@@ -373,3 +373,16 @@ fn native_handles_preserve_destructor_and_owner_metadata() {
         let _ = parse(&source[..end]);
     }
 }
+
+#[test]
+fn native_structs_parse_nested_fields_and_pointer_links() {
+    let source = r#"native "fixture" {
+        struct Outer { tag:UInt8; pair:Pair; next:Ptr<Outer>; }
+        struct Pair { x:Int32; y:Double; };
+        function fill(value:Outer):Void;
+    }
+    var struct = 1;"#;
+    assert_eq!(tree(source), "(native \"fixture\" (struct Outer (tag UInt8) (pair Pair) (next Ptr<Outer>)) (struct Pair (x Int32) (y Double)) (fn fill (value:Outer) Void))\n(var (struct 1))");
+    for (end, _) in source.char_indices().chain(std::iter::once((source.len(), ' '))) { let _ = parse(&source[..end]); }
+    has_error("native \"fixture\" { @:packed struct Pair { x:Int32; } }", "struct annotations are not supported");
+}

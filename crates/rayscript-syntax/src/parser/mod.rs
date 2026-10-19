@@ -272,12 +272,16 @@ impl<'a> Parser<'a> {
         };
         let mut functions = Vec::new();
         let mut handles = Vec::new();
+        let mut structs = Vec::new();
         if self.expect(&TokenKind::LBrace) {
             while !self.is(&TokenKind::RBrace) && !self.is(&TokenKind::Eof) {
                 let before = self.cur.span.start;
                 let meta = self.parse_meta();
                 if self.is_kw(Kw::Function) {
                     functions.push(self.parse_native_fn(meta));
+                } else if matches!(&self.cur.kind, TokenKind::Ident(n) if n == "struct") {
+                    if !meta.is_empty() { self.error(meta[0].span, "native struct annotations are not supported"); }
+                    structs.push(self.parse_native_struct());
                 } else if matches!(&self.cur.kind, TokenKind::Ident(n) if n == "handle") {
                     let start = self.cur.span.start;
                     self.advance();
@@ -287,7 +291,7 @@ impl<'a> Parser<'a> {
                 } else {
                     let found = self.cur.kind.describe();
                     let span = self.cur.span;
-                    self.error(span, format!("expected `function` or `handle` in a native block, found {found}"));
+                    self.error(span, format!("expected `function`, `handle` or `struct` in a native block, found {found}"));
                     self.synchronize();
                 }
                 if self.cur.span.start == before {
@@ -296,7 +300,28 @@ impl<'a> Parser<'a> {
             }
             self.expect(&TokenKind::RBrace);
         }
-        NativeBlock { library, library_span, functions, handles, span: Span::new(start, self.prev_end) }
+        NativeBlock { library, library_span, functions, handles, structs, span: Span::new(start, self.prev_end) }
+    }
+
+    fn parse_native_struct(&mut self) -> NativeStruct {
+        let start = self.cur.span.start;
+        self.advance();
+        let name = self.expect_ident("a struct name");
+        let mut fields = Vec::new();
+        if self.expect(&TokenKind::LBrace) {
+            while !self.is(&TokenKind::RBrace) && !self.is(&TokenKind::Eof) {
+                let before = self.cur.span.start;
+                let name = self.expect_ident("a struct field name");
+                self.expect(&TokenKind::Colon);
+                let ty = self.parse_type();
+                fields.push(TypeField { name, ty, optional: false });
+                self.expect_semi();
+                if self.cur.span.start == before { self.advance(); }
+            }
+            self.expect(&TokenKind::RBrace);
+        }
+        self.eat(&TokenKind::Semi);
+        NativeStruct { name, fields, span: Span::new(start, self.prev_end) }
     }
 
     fn parse_native_fn(&mut self, meta: Vec<Meta>) -> NativeFn {

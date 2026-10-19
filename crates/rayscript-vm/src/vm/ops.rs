@@ -175,7 +175,8 @@ impl Vm {
         if let Value::Obj(o) = obj {
             match o.kind() {
                 Kind::Host => {
-                    if let Some(result) = super::ffi::get_field(o, self.syms.name(sym)) {
+                    let name = self.syms.name(sym).to_string();
+                    if let Some(result) = super::ffi::get_field(self, o, &name) {
                         return result.map_err(|e| self.err(e));
                     }
                 }
@@ -202,6 +203,9 @@ impl Vm {
     pub(crate) fn set_field(&mut self, obj: Value, sym: u32, v: Value) -> Result<(), Value> {
         if let Value::Obj(o) = obj {
             match o.kind() {
+                Kind::Host => {
+                    if let Some(result) = super::ffi::set_field(o, self.syms.name(sym), v) { return result.map_err(|e| self.err(e)); }
+                }
                 Kind::Object => {
                     o.object().fields.set(sym, v);
                     return Ok(());
@@ -220,6 +224,9 @@ impl Vm {
 
     pub(crate) fn get_index(&mut self, obj: Value, index: Value) -> Result<Value, Value> {
         if let Value::Obj(o) = obj {
+            if o.kind() == Kind::Host {
+                if let Some(result) = super::ffi::get_index(self, o, index) { return result.map_err(|e| self.err(e)); }
+            }
             match (o.kind(), index) {
                 (Kind::Bytes, Value::Int(i)) => {
                     return Ok(usize::try_from(i).ok().and_then(|i| o.bytes().slice().get(i)).map(|n| Value::Int(*n as i64)).unwrap_or(Value::Nil));
@@ -247,6 +254,9 @@ impl Vm {
 
     pub(crate) fn set_index(&mut self, obj: Value, index: Value, v: Value) -> Result<(), Value> {
         if let Value::Obj(o) = obj {
+            if o.kind() == Kind::Host {
+                if let Some(result) = super::ffi::set_index(o, index, v) { return result.map_err(|e| self.err(e)); }
+            }
             match (o.kind(), index) {
                 (Kind::Bytes, Value::Int(i)) => {
                     let Some(index) = usize::try_from(i).ok().filter(|i| *i < o.bytes().len()) else { return Err(self.err("Bytes index out of range")); };
