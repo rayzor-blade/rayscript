@@ -12,6 +12,8 @@ path = "src/main.rs"
 [dependencies]
 rayscript-syntax.workspace = true
 rayscript-vm.workspace = true
+sha2 = "=0.10.9"
+tempfile = "=3.27.0"
 
 [dev-dependencies]
 rayscript-ffi-fixture = { path = "../rayscript-ffi-fixture" }

@@ -10,6 +10,10 @@
 //! - `{"t":"module","path":"rayde.workspace","functions":["say","activeBuffer"]}` makes a module that
 //!   scripts can `import`. Each function, when called, sends a `call` and gives the script a promise to
 //!   `await`. Send these before `run`.
+//! - `{"t":"natives","root":"/extension","capabilities":["native:git2"],"libraries":[{"name":"git2","path":"natives/libgit2.dylib","sha256":"..."}]}`
+//!   grants native execution before any script runs, once per host. Only the editor may send approved
+//!   declarations. All paths and hashes are validated before registrations become available. Failure
+//!   prevents scripts from running; success sends `{"t":"nativesReady"}`.
 //! - `{"t":"run","name":"main.rays","source":"..."}` runs a script. The host imports other script
 //!   modules from files under its `--root`, and the standard library and remote modules from itself.
 //! - `{"t":"event","node":7,"event":"click","payload":...}` sends an event to the handler of an element.
@@ -67,6 +71,7 @@
 //! heading of its view. A view mounted with a name that begins `tab:` is meant for a tab, titled by the rest.
 
 pub mod wire;
+mod native_manifest;
 
 use rayscript_syntax::{Diagnostic, LineIndex, Severity};
 use rayscript_vm::stdlib::json::{parse, quote, stringify};
@@ -154,6 +159,9 @@ fn remote_call(vm: &mut Vm, out: &Outbox, name: &str, args: &[Value]) -> Result<
 /// One extension: a VM, the modules the editor has described, and the lines waiting to be sent.
 pub struct Host {
     vm: Vm,
+    native_files: Option<tempfile::TempDir>,
+    native_sealed: bool,
+    native_denied: bool,
     out: Outbox,
     modules: Rc<RefCell<HashMap<String, Vec<String>>>>,
     timers: Rc<RefCell<BinaryHeap<Reverse<(Instant, u64)>>>>,
@@ -258,7 +266,7 @@ impl Host {
             });
         }
         let slice = if config.slice.is_zero() { Duration::from_millis(4) } else { config.slice };
-        Host { vm, out, modules, timers, tools, hooks, commands, scripts: Vec::new(), shutdown: false, ops_sent: 0, slice, pause_told: false }
+        Host { vm, native_files: None, native_sealed: false, native_denied: false, out, modules, timers, tools, hooks, commands, scripts: Vec::new(), shutdown: false, ops_sent: 0, slice, pause_told: false }
     }
 
     pub fn vm(&mut self) -> &mut Vm {
@@ -327,6 +335,27 @@ impl Host {
             return;
         };
         match kind.as_str() {
+            "natives" => {
+                if self.native_sealed {
+                    self.error("native", "Native grants must precede scripts and can be configured only once", "");
+                    return;
+                }
+                self.native_sealed = true;
+                match native_manifest::prepare(&self.vm, msg) {
+                    Ok((files, grants)) => {
+                        for grant in grants {
+                            // The editor grants native execution; paths and copied bytes were validated above.
+                            unsafe { self.vm.register_native_library(&grant.name, &grant.path); }
+                        }
+                        self.native_files = Some(files);
+                        self.send("{\"t\":\"nativesReady\"}".into());
+                    }
+                    Err(error) => {
+                        self.native_denied = true;
+                        self.error("native", &error, "");
+                    }
+                }
+            }
             "run" => {
                 let name = self.string_field(msg, "name").unwrap_or_else(|| "main.rays".into());
                 match self.string_field(msg, "source") {
@@ -624,6 +653,11 @@ impl Host {
     }
 
     fn run(&mut self, name: &str, source: &str) {
+        self.native_sealed = true;
+        if self.native_denied {
+            self.error("native", "Native configuration failed; restart the host before running scripts", "");
+            return;
+        }
         let parsed = rayscript_syntax::parse(source);
         if parsed.has_errors() {
             self.diagnostics("syntax", name, source, &parsed.diagnostics);

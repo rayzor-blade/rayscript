@@ -25,7 +25,22 @@ let result = vm.run_source("native.rays", r#"
 assert_eq!(vm.display(result), "42");
 ```
 
-Registration is unsafe: loading a library executes its initialization code, and a C symbol carries no signature information the VM can verify. Script declarations must match the exported ABI. Bound functions, pointers and handles keep their library loaded even if the registration is later replaced. The extension host registers no libraries by default; native manifest trust and hash checks are not implemented yet.
+Registration is unsafe: loading a library executes its initialization code, and a C symbol carries no signature information the VM can verify. Script declarations must match the exported ABI. Bound functions, pointers and handles keep their library loaded even if the registration is later replaced. The extension host registers no libraries by default. An editor may grant native execution once, before any script attempt, with a `natives` protocol message:
+
+```json
+{
+  "t": "natives",
+  "root": "/absolute/extension/root",
+  "capabilities": ["native:fixture"],
+  "libraries": [{"name": "fixture", "path": "natives/libfixture.dylib", "sha256": "<64 hexadecimal digits>"}]
+}
+```
+
+This is an editor permission boundary: send only declarations the user approved, or trusted built-in declarations. It is not a script API. Names must start with a letter or underscore and contain only letters, digits, underscores or hyphens. Every library needs its `native:<name>` capability; undeclared native capabilities are rejected. Paths must be relative, without traversal, and resolve to regular files inside the extension root. A symlink that stays inside the root is allowed.
+
+The host copies and hashes every file into a private temporary directory, preserving relative paths. It registers nothing until all entries pass. A `nativesReady` response confirms success; an error of kind `native` blocks all script execution until the host is restarted. Native grants cannot be replaced or added after a script attempt. Script `native` blocks still bind lazily, against the validated copies, so later edits to the installed files cannot change what loads. The host retains the copies until after the VM and its native resources are destroyed. Normal shutdown removes them; forced process termination can leave files in the operating system's temporary directory.
+
+The editor must manage approval identity and revocation. RayDE stores user approvals bound to the extension id and canonical manifest location, library name, relative path and hash; workspace settings cannot grant them. Built-in scope is pre-approved by RayDE, not by the host protocol. A trusted native extension can execute arbitrary native code, and its scripts must satisfy the unsafe embedding contract above. Hashes cover the declared files, not transitively loaded system dependencies. Non-system dependencies should be declared and approved too, preserving the relative loader paths between them.
 
 ## Types
 
