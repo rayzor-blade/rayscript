@@ -1,0 +1,12 @@
+var count = signal(0);
+var items = signal(['milk', 'eggs']);
+var label = computed(() -> count.value == 1 ? '1 click' : '${count.value} clicks');
+
+mount(() -> <div class="flex flex-col gap-2">
+  <p>{label}</p>
+  <button onClick={() -> count.value++}>Add</button>
+  <if {count.value > 2}><b>many</b></if>
+  <ul>
+    <for {item in items}><li>{item}</li></for>
+  </ul>
+</div>);
