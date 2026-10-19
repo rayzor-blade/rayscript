@@ -414,22 +414,54 @@ impl Compiler {
             if !names.insert(&h.name.name) {
                 self.error(h.span, "duplicate native handle name");
             }
-            let free = match h.meta.as_slice() {
-                [meta] if meta.name == ":free" => match meta.args.as_slice() {
-                    [ast::Expr { kind: ast::ExprKind::Ident(name), .. }] => Some(name.clone()),
-                    _ => None,
-                },
-                _ => None,
-            };
+            let mut free = None;
+            let mut refcounted = false;
+            for meta in &h.meta {
+                match (meta.name.as_str(), meta.args.as_slice()) {
+                    (
+                        ":free",
+                        [
+                            ast::Expr {
+                                kind: ast::ExprKind::Ident(name),
+                                ..
+                            },
+                        ],
+                    ) if free.is_none() => free = Some(name.clone()),
+                    (":refcounted", []) if !refcounted => refcounted = true,
+                    _ => self.error(
+                        h.span,
+                        "a native handle accepts one @:free(function) and optional @:refcounted",
+                    ),
+                }
+            }
             let Some(free) = free else {
-                self.error(h.span, "a native handle needs exactly one @:free(function) annotation");
+                self.error(
+                    h.span,
+                    "a native handle needs exactly one @:free(function) annotation",
+                );
                 continue;
             };
-            if !n.functions.iter().any(|f| f.name.name == free && f.params.len() == 1
-                && ty(&f.params[0].ty) == h.name.name && ty(&f.ret) == "Void" && f.meta.is_empty()) {
-                self.error(h.span, format!("handle {} needs `function {}(value:{}):Void;` in its native block", h.name.name, free, h.name.name));
+            if !n.functions.iter().any(|f| {
+                f.name.name == free
+                    && f.params.len() == 1
+                    && ty(&f.params[0].ty) == h.name.name
+                    && ty(&f.ret) == "Void"
+                    && f.meta.is_empty()
+            }) {
+                self.error(
+                    h.span,
+                    format!(
+                        "handle {} needs `function {}(value:{}):Void;` in its native block",
+                        h.name.name, free, h.name.name
+                    ),
+                );
             }
-            let spec = format!("{}\0{}\0handle\0{}", n.library, h.name.name, free);
+            let flags = if refcounted {
+                format!("{free};refcounted")
+            } else {
+                free.clone()
+            };
+            let spec = format!("{}\0{}\0handle\0{}", n.library, h.name.name, flags);
             let k = self.const_str(&spec);
             let m = self.mark();
             let t = self.alloc();

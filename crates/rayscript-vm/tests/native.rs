@@ -32,10 +32,13 @@ unsafe impl GlobalAlloc for TrackingAllocator {
 }
 
 fn with_vm(f: impl FnOnce(&mut Vm) + Send + 'static) {
+    with_vm_stress(false, f);
+}
+fn with_vm_stress(stress: bool, f: impl FnOnce(&mut Vm) + Send + 'static) {
     std::thread::Builder::new()
         .stack_size(16 << 20)
         .spawn(move || {
-            let mut vm = Vm::new();
+            let mut vm = Vm::with_config(rayscript_vm::heap::HeapConfig { stress, ..Default::default() });
             // This fixture's symbols have the declarations used below and no external initialization requirements.
             unsafe {
                 vm.register_native_library("fixture", rayscript_ffi_fixture::LIBRARY_PATH);
@@ -2049,5 +2052,64 @@ fn concurrent_foreign_callbacks_are_serialized_while_a_callback_waits() {
             return [result, calls];
         "#).unwrap();
         assert_eq!(vm.display(result), "[23,2]");
+    });
+}
+
+const LEASES: &str = r#"
+native "fixture" {
+    @:refcounted @:free(lease_release) handle Lease;
+    function lease_new():Lease;
+    function lease_retain(value:Lease):Lease;
+    function lease_out(out:Out<Lease>, value:Lease):Void;
+    function lease_release(value:Lease):Void;
+    function lease_count(value:Lease):SizeT;
+    function lease_freed():SizeT;
+    @:failure(-1) callback LeaseVisit(a:Int64,b:Int64):Int64;
+    function lease_callback(value:Lease, cb:LeaseVisit):Lease;
+}
+"#;
+
+#[test]
+fn refcounted_handles_own_each_returned_reference() {
+    for stress in [false, true] {
+        with_vm_stress(stress, |vm| {
+            let value = vm.run_source("leases.rays", &format!(r#"{LEASES}
+                var before=lease_freed(), root=lease_new(), first=lease_retain(root), out=Out(Lease);
+                lease_out(out,root); var last=out.value;
+                first.close(); first.close(); gc();
+                var count=lease_count(last); root.close();
+                var remaining=lease_count(last); last.close(); out=null; gc();
+                return [count,remaining,lease_freed()-before];
+            "#)).unwrap();
+            assert_eq!(vm.display(value), "[2,1,1]");
+            let before = vm.run_source("lease-gc.rays", &format!(r#"{LEASES}
+                var before=lease_freed(), root=lease_new(), other=lease_retain(root);
+                root=null; other=null; return before;
+            "#)).unwrap();
+            vm.collect();
+            let count = bind(vm, "function lease_freed():SizeT;", "lease_freed");
+            let after = vm.call(count, &[]).unwrap();
+            assert_eq!(vm.display(after).parse::<usize>().unwrap(), vm.display(before).parse::<usize>().unwrap()+1);
+
+        });
+    }
+}
+
+#[test]
+fn refcounted_result_survives_another_reference_closed_in_callback() {
+    with_vm(|vm| {
+        let value = vm
+            .run_source(
+                "lease-callback.rays",
+                &format!(
+                    r#"{LEASES}
+            var root=lease_new();
+            var last=lease_callback(root,LeaseVisit((a,b) -> {{ root.close(); gc(); return 0; }}));
+            var count=lease_count(last); last.close(); return [count,lease_freed()];
+        "#
+                ),
+            )
+            .unwrap();
+        assert_eq!(vm.display(value), "[1,1]");
     });
 }

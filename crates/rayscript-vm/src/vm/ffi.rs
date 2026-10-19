@@ -201,6 +201,7 @@ impl NativeType {
 struct HandleType {
     name: String,
     free_name: String,
+    refcounted: bool,
     _library: Rc<Library>,
     free: unsafe extern "C" fn(*mut c_void),
     live: RefCell<HashMap<usize, Weak<Resource>>>,
@@ -232,7 +233,9 @@ impl Resource {
         for child in self.children.borrow().iter().filter_map(Weak::upgrade) {
             child.close();
         }
-        self.ty.live.borrow_mut().remove(&(ptr as usize));
+        if !self.ty.refcounted {
+            self.ty.live.borrow_mut().remove(&(ptr as usize));
+        }
         // The declaration and library registration guarantee a one-pointer C destructor.
         self.releases.borrow_mut().push_back(Release {
             resource: self as *const Self as usize,
@@ -247,7 +250,9 @@ impl Drop for Resource {
     fn drop(&mut self) {
         let ptr = self.ptr.get();
         if !ptr.is_null() {
-            self.ty.live.borrow_mut().remove(&(ptr as usize));
+            if !self.ty.refcounted {
+                self.ty.live.borrow_mut().remove(&(ptr as usize));
+            }
             self.releases.borrow_mut().push_back(Release {
                 resource: self as *const Self as usize,
                 ptr,
@@ -639,6 +644,10 @@ impl Vm {
             return structure::bind(self, library, symbol, flags);
         }
         if signature == "handle" {
+            let (free_name, refcounted) = match flags.strip_suffix(";refcounted") {
+                Some(name) => (name, true),
+                None => (flags, false),
+            };
             if self
                 .foreign
                 .structures
@@ -658,18 +667,20 @@ impl Vm {
             }
             let key = (library.into(), symbol.into());
             let ty = if let Some(existing) = self.foreign.types.get(&key) {
-                if existing.free_name != flags {
+                if existing.free_name != free_name || existing.refcounted != refcounted {
                     return Err("handle already declared with a different free function".into());
                 }
                 existing.clone()
             } else {
                 let loaded = self.native_library(library)?;
-                let free =
-                    *unsafe { loaded.get::<unsafe extern "C" fn(*mut c_void)>(flags.as_bytes()) }
-                        .map_err(|e| format!("free symbol `{flags}` not found: {e}"))?;
+                let free = *unsafe {
+                    loaded.get::<unsafe extern "C" fn(*mut c_void)>(free_name.as_bytes())
+                }
+                .map_err(|e| format!("free symbol `{flags}` not found: {e}"))?;
                 let ty = Rc::new(HandleType {
                     name: name.into(),
-                    free_name: flags.into(),
+                    free_name: free_name.into(),
+                    refcounted,
                     _library: loaded,
                     free,
                     live: RefCell::new(HashMap::new()),
@@ -981,20 +992,25 @@ impl Bound {
                 if ptr.is_null() {
                     return Ok(Value::Nil);
                 }
-                if vm
-                    .foreign
-                    .releases
-                    .borrow()
-                    .iter()
-                    .any(|release| release.ptr == ptr && Rc::ptr_eq(&release.ty, ty))
+                if !ty.refcounted
+                    && vm
+                        .foreign
+                        .releases
+                        .borrow()
+                        .iter()
+                        .any(|release| release.ptr == ptr && Rc::ptr_eq(&release.ty, ty))
                 {
                     return Err("native returned a handle closed during the active call".into());
                 }
-                let existing = ty
-                    .live
-                    .borrow()
-                    .get(&(ptr as usize))
-                    .and_then(Weak::upgrade);
+                // Each reference-counted result owns a separate C reference, even at the same address.
+                let existing = if ty.refcounted {
+                    None
+                } else {
+                    ty.live
+                        .borrow()
+                        .get(&(ptr as usize))
+                        .and_then(Weak::upgrade)
+                };
                 let resource = if let Some(existing) = existing {
                     let same_owner = match (&existing.parent, owner) {
                         (None, None) => true,
@@ -1019,9 +1035,11 @@ impl Bound {
                         children.retain(|c| c.strong_count() > 0);
                         children.push(Rc::downgrade(&resource));
                     }
-                    ty.live
-                        .borrow_mut()
-                        .insert(ptr as usize, Rc::downgrade(&resource));
+                    if !ty.refcounted {
+                        ty.live
+                            .borrow_mut()
+                            .insert(ptr as usize, Rc::downgrade(&resource));
+                    }
                     if owner.is_some_and(|(_, parent)| parent.ptr.get().is_null()) {
                         resource.close();
                     }

@@ -101,6 +101,8 @@ Native blocks declare handles before binding their functions, regardless of sour
 
 `handle.close()` immediately invalidates all its aliases and borrowed pointers, and can be called repeatedly. It frees child handles before the handle. When called during a native callback, the frees wait until the outermost C call returns. Calling the declared free function has the same effect. Closed handles compare equal to null and are false in conditions; passing one to a native function raises an error. Repeated returns of the same live address and handle type share ownership; conflicting owner declarations raise an error.
 
+Libraries that return a newly owned reference to a cached object can declare `@:refcounted @:free(release) handle Object;`. Each direct result or `Out<Object>` result then owns a separate C reference, including when several results have the same address. Closing one result leaves the others usable and calls `release` exactly once for that reference; collection and teardown release abandoned references too. The C API must actually transfer a reference on every such result. Callback arguments and native struct fields remain borrowed and do not acquire a new C reference.
+
 Unreachable handles queue their frees during collection. The VM drains that queue after the heap sweep, on the VM thread. A queued child retains its owner until its free function finishes. VM teardown uses the same order. Destructors must not call back into the VM. During an active C call, collection queues frees until C has returned.
 
 ## Byte buffers

@@ -732,3 +732,35 @@ pub unsafe extern "C" fn callback_workers(callback: Visit) -> i32 {
     let b = std::thread::spawn(move || unsafe { callback(2, std::ptr::null_mut()) });
     a.join().unwrap() + b.join().unwrap()
 }
+
+#[repr(C)]
+pub struct Lease { references: usize }
+thread_local! { static LEASE_FREED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[unsafe(no_mangle)]
+pub extern "C" fn lease_new() -> *mut Lease { Box::into_raw(Box::new(Lease { references: 1 })) }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lease_retain(value: *mut Lease) -> *mut Lease {
+    unsafe { (*value).references += 1; } value
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lease_out(out: *mut *mut Lease, value: *mut Lease) {
+    unsafe { *out = lease_retain(value); }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lease_release(value: *mut Lease) {
+    unsafe {
+        (*value).references -= 1;
+        if (*value).references == 0 {
+            drop(Box::from_raw(value));
+            LEASE_FREED.with(|n| n.set(n.get() + 1));
+        }
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lease_count(value: *mut Lease) -> usize { unsafe { (*value).references } }
+#[unsafe(no_mangle)]
+pub extern "C" fn lease_freed() -> usize { LEASE_FREED.with(|n| n.get()) }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lease_callback(value: *mut Lease, cb: unsafe extern "C" fn(i64, i64) -> i64) -> *mut Lease {
+    unsafe { cb(0,0); lease_retain(value) }
+}
