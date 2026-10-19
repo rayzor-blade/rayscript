@@ -567,7 +567,7 @@ fn a_stopped_script_runs_nothing_until_it_goes_on_and_holds_the_events_that_come
     // It stops again for the second handler, once the first is done.
     e.debug("continue", "");
     assert_eq!(e.of_kind("paused").len(), 2, "the held click stops at the same line");
-    assert_eq!(e.html(), "<div><b>1</b><button>+</button></div>");
+    assert_eq!(e.html(), "<div><b>0</b><button>+</button></div>", "stopped again before the view is brought up to date");
     e.debug("breakpoints", ",\"file\":\"main.rays\",\"lines\":[]");
     e.debug("continue", "");
     assert_eq!(e.html(), "<div><b>2</b><button>+</button></div>");
@@ -605,4 +605,19 @@ fn debug_messages_that_need_a_stopped_script_say_so_when_there_is_none() {
     let errors: Vec<String> = e.of_kind("error").iter().map(|m| e.text(m, "message")).collect();
     assert_eq!(errors.len(), 3, "{errors:?}");
     assert!(errors[0].contains("no fiber is stopped") && errors[2].contains("Unknown `debug` op"), "{errors:?}");
+}
+
+#[test]
+fn what_a_stopped_handler_changed_is_not_drawn_until_it_goes_on() {
+    let mut e = Editor::new();
+    e.debug("breakpoints", ",\"file\":\"main.rays\",\"lines\":[3]");
+    e.run("var n = signal(0);\nfunction bump() {\n  n.value = 1;\n  var after = n.value;\n  return after;\n}\nmount(() -> <div><b>{n}</b><button onClick={() -> bump()}>+</button></div>);\n");
+    e.settle();
+    e.click("button");
+    e.debug("stepOver", "");
+    assert_eq!(e.text(e.last("paused"), "reason"), "step");
+    // Line 3 has run, so the signal holds 1, but the view is only brought up to date when the script goes on.
+    assert_eq!(e.html(), "<div><b>0</b><button>+</button></div>");
+    e.debug("continue", "");
+    assert_eq!(e.html(), "<div><b>1</b><button>+</button></div>");
 }

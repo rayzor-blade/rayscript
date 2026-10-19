@@ -221,6 +221,9 @@ impl Vm {
             return false;
         }
         self.tick(fuel);
+        if self.debug_paused().is_some() {
+            return false;
+        }
         self.view_reap_handlers();
         self.view_flush();
         self.has_ready() || !self.view.queue.is_empty()
