@@ -2,7 +2,7 @@
 
 A dynamic scripting language with Haxe syntax and HXX markup, run by a bytecode VM written in Rust. RayDE uses it for extensions.
 
-```
+```jsx
 function area(shape) {
   return switch (shape.kind) {
     case 'circle': 3.14159 * shape.r * shape.r;
@@ -39,7 +39,7 @@ var slow = spawn(() -> { yield(); return 'done'; });
 return {total: total, names: names, next: next(), fiber: await slow};
 ```
 
-```
+```bash
 $ cargo run -p rayscript-cli -- run examples/hello.rays
 skipped: unknown shape triangle
 {total: 24.56636, names: [a=1,b=2,c=3], next: 2, fiber: done}
@@ -49,7 +49,7 @@ skipped: unknown shape triangle
 
 Markup is an expression. `signal` and `computed` hold state; `mount` draws a view and keeps it up to date.
 
-```
+```jsx
 var count = signal(0);
 var items = signal(['milk', 'eggs']);
 var label = computed(() -> count.value == 1 ? '1 click' : '${count.value} clicks');
@@ -64,7 +64,7 @@ mount(() -> <div class="flex flex-col gap-2">
 </div>);
 ```
 
-```
+```bash
 $ cargo run -p rayscript-cli -- view examples/counter.rays
 <#root name="main">
   <div class="flex flex-col gap-2">
